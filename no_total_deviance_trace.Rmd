@@ -1,0 +1,3588 @@
+---
+title: "Bayesian IRT Analysis of INVALSI Test Data"
+author: "Riccardo Pugliese"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
+    theme: flatly
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  warning = FALSE,
+  message = FALSE,
+  fig.width = 8,
+  fig.height = 5
+)
+```
+# Introduction
+
+This project applies Bayesian Item Response Theory to INVALSI Grade 10 Italian test data.
+
+The data used in this project come from the official INVALSI statistical service page:
+
+<https://serviziostatistico.invalsi.it/en/invalsi_ss_data/microdati-campione-g10-2015-16-italiano/>
+
+The dataset is called:
+
+**Microdati Campione G10 2015-16 Italiano**
+
+These data are official INVALSI sample microdata for the Grade 10 Italian test (second year of high school, 15/16 years old). They are student-level data, meaning that each row refers to one student. The dataset has already been prepared, structured, and cleaned by INVALSI before being released. Therefore, it is not a raw dataset collected directly from schools, but an official dataset made available for statistical and research purposes.
+
+The dataset is also based on a balanced sample. For this project, this aspect is not the main methodological focus, because the goal is not to estimate national descriptive statistics. However, it is still useful to know that the data come from an official and carefully designed INVALSI sample, rather than from an arbitrary collection of students.
+
+The actual Italian test questions given to students can be found here:
+
+<https://www.engheben.it/prof/materiali/invalsi/invalsi_seconda_superiore/2015-2016/invalsi_italiano_2015-2016_secondaria_seconda.pdf>
+
+This is useful because it allows us to connect the item columns in the dataset with the real questions answered by the students.
+
+Item Response Theory is useful because it does not only consider the final score of a student. Instead, it analyses the full pattern of correct and incorrect answers. In this way, the model can estimate latent characteristics of both students and questions.
+
+The main goal of the project is to estimate two latent quantities:
+
+- `theta[i]`: the ability of student `i`;
+- `b[j]`: the difficulty of item `j`.
+
+These quantities are called latent because they are not directly observed in the dataset. What we observe is only whether each student answered each question correctly or incorrectly. Bayesian modelling allows us to estimate these latent quantities through posterior distributions.
+
+The project compares two Bayesian IRT models:
+
+1. Rasch / 1PL model;
+2. 2PL model.
+
+The Rasch model estimates student ability and item difficulty. The 2PL model extends the Rasch model by adding item discrimination, which measures how well an item separates stronger and weaker students.
+
+I chose the 2015/16 dataset instead of more recent INVALSI datasets for an important methodological reason. In more recent years, INVALSI tests have increasingly moved to computer-based testing. In this setting, students may not all receive exactly the same set of questions. Even if the tests are designed to be comparable, this creates a more complex item-response structure, with many missing responses by design.
+
+The simple Rasch and 2PL models used in this project assume a clean response matrix, where the same item columns correspond to the same questions for all students. If students answer different sets of items, the model becomes more complicated and requires a more advanced IRT structure.
+
+For this reason, the 2015/16 Grade 10 Italian dataset is more appropriate for this project. It provides real educational data, binary item responses, and an official external score, while keeping the response matrix simple enough for a Bayesian MCMC analysis in JAGS.
+
+The official score `WLE_ITA_200` is not used inside the Bayesian models. It is used only later as an external validation benchmark. If the Bayesian estimate of student ability is meaningful, it should be positively related to the official INVALSI WLE score.
+
+# Dataset structure
+
+The dataset contains several different types of variables.
+
+First, it contains student-level information. These variables describe some characteristics of the students included in the sample.
+
+Second, it contains school-related information. These variables refer to the school context of each student, for example information connected to the school or class.
+
+Third, the dataset includes performance-related variables, such as official INVALSI scores. In particular, the variable `WLE_ITA_200` represents the official INVALSI ability score for the Italian test, expressed on the INVALSI scale.
+
+The dataset also contain information about students' results in other INVALSI tests or other assessment-related variables. Therefore, the original file is richer than what is strictly needed for this project.
+
+For the purpose of this analysis, however, we are interested only in two types of variables:
+
+1. the binary item-response variables;
+2. the official `WLE_ITA_200` score.
+
+The binary item-response variables are the columns that indicate whether each student answered each Italian test item correctly or incorrectly. Each selected item column represents one Italian test question.
+
+The answer is coded as:
+
+- `1` = correct answer;
+- `0` = incorrect answer.
+
+Therefore, the data used in the Bayesian models can be written as a matrix \(Y\), where \(Y_{ij}\) is the answer of student \(i\) to item \(j\).
+
+Each row of this matrix represents one Grade 10 student. Each column represents one selected Italian test item.
+
+The Bayesian IRT models are estimated only using this binary response matrix. The models do not directly use the final score of the student. Instead, they try to reconstruct student ability and item difficulty from the observed pattern of correct and incorrect answers.
+
+The variable `WLE_ITA_200` is kept separately. It is not used inside the Rasch model or the 2PL model. It is used only at the end of the analysis as an external validation benchmark.
+
+The idea is simple: if the Bayesian estimate of student ability is reasonable, students with higher posterior ability estimates should also tend to have higher official INVALSI WLE scores.
+
+# Load packages
+
+```{r packages}
+library(haven)
+library(dplyr)
+library(ggplot2)
+library(ggrepel)
+library(rjags)
+library(coda)
+library(tidyr)
+
+set.seed(123)
+```
+
+# Settings
+
+Change only the values in this section before running the project.
+
+Here we can select three different type of running mode. If you select `"fast"` you have a model that runs fast, thanks to low number of sampled students, MCMC chain, adaptation iterations, burn-in iterations discarded before saving posterior draws and posterior iterations after burn-in.
+If you use `"final"`, then basically you have a model with higher parameters.
+If you use `"reuse"`, you are reloading the same saved sample, posterior results, and simulation settings without running MCMC again.
+
+
+```{r settings}
+# Choose one of these modes:
+# "fast"  = lighter settings for testing the project quickly.
+# "final" = stronger settings for the final run.
+# "reuse" = do not run MCMC again; reload the previous sample, posterior results, and settings.
+run_mode <- "reuse"
+
+# Set TRUE if you want to estimate the 2PL model in fast/final mode.
+# In reuse mode this value is automatically taken from run_metadata.RData.
+run_2pl <- TRUE
+
+# Set TRUE if you want to compute DIC during the first fast/final model run.
+# The computed DIC is then saved and reloaded in reuse mode, so it is not recomputed every time.
+run_dic <- TRUE
+
+# Folder where the output files are saved and reloaded.
+# "." means the current working directory.
+results_dir <- "."
+
+# Put here the path to the extracted INVALSI .SAV file.
+# Do not put the path to the .zip file.
+data_path <- "C:/Users/39392/Desktop/università/data science/tardella/progetto/Matrice_10_ita_campione_0_1_WLE_anonima.SAV"
+
+# Stop the code if the user accidentally gives the .zip file instead of the .SAV file.
+if(grepl("\\.zip$", data_path, ignore.case = TRUE)) {
+  stop("You inserted the path to a .zip file. Please extract the zip file first and use the path to the .SAV file.")
+}
+
+# Helper function used later to convert a JAGS DIC object into a simple table.
+extract_dic_values <- function(dic_object, model_name) {
+  data.frame(
+    model = model_name,
+    mean_deviance = sum(dic_object$deviance),
+    effective_parameters_pD = sum(dic_object$penalty),
+    DIC = sum(dic_object$deviance) + sum(dic_object$penalty)
+  )
+}
+
+# Helper function used later to summarize the MCMC trace of the total deviance.
+# This is useful because DIC is based on the posterior mean deviance.
+summarise_deviance_trace <- function(deviance_samples, model_name) {
+  deviance_values <- as.numeric(as.matrix(deviance_samples)[, "total_deviance"])
+  
+  data.frame(
+    model = model_name,
+    mean_total_deviance = mean(deviance_values),
+    sd_total_deviance = sd(deviance_values),
+    lower_95 = as.numeric(quantile(deviance_values, 0.025)),
+    median = as.numeric(quantile(deviance_values, 0.500)),
+    upper_95 = as.numeric(quantile(deviance_values, 0.975)),
+    monte_carlo_se = sd(deviance_values) / sqrt(length(deviance_values))
+  )
+}
+
+# This function creates the project settings for fast/final mode.
+# In reuse mode, it reloads the settings saved during the previous fast/final run.
+configure_project_run <- function(run_mode = c("fast", "final", "reuse"),
+                                  run_2pl = TRUE,
+                                  run_dic = FALSE,
+                                  results_dir = ".") {
+  
+  run_mode <- match.arg(run_mode)
+  
+  if(!dir.exists(results_dir)) {
+    dir.create(results_dir, recursive = TRUE)
+  }
+  
+  metadata_file <- file.path(results_dir, "run_metadata.RData")
+  
+  if(run_mode == "fast") {
+    settings <- list(
+      n_sample = 500,
+      n_chains = 3,
+      n_adapt = 200,
+      burn_in = 200,
+      n_iter = 500,
+      thin_value = 1
+    )
+  }
+  
+  if(run_mode == "final") {
+    settings <- list(
+      n_sample = 1500,
+      n_chains = 3,
+      n_adapt = 1000,
+      burn_in = 1000,
+      n_iter = 3000,
+      thin_value = 3
+    )
+  }
+  
+  if(run_mode == "reuse") {
+    
+    if(!file.exists(metadata_file)) {
+      stop(
+        "Reuse mode was selected, but run_metadata.RData was not found in results_dir. ",
+        "Run the project once in fast or final mode first, so the settings can be saved."
+      )
+    }
+    
+    load(metadata_file, envir = environment())
+    
+    required_metadata_fields <- c(
+      "run_mode", "n_sample", "n_items", "n_chains",
+      "n_adapt", "burn_in", "n_iter", "thin_value", "run_2pl"
+    )
+    
+    missing_metadata_fields <- setdiff(required_metadata_fields, names(run_metadata))
+    
+    if(length(missing_metadata_fields) > 0) {
+      stop(
+        "run_metadata.RData exists, but it is missing these fields: ",
+        paste(missing_metadata_fields, collapse = ", "),
+        ". Re-run the project in fast or final mode with this updated file."
+      )
+    }
+    
+    settings <- list(
+      n_sample = run_metadata$n_sample,
+      n_items = run_metadata$n_items,
+      n_chains = run_metadata$n_chains,
+      n_adapt = run_metadata$n_adapt,
+      burn_in = run_metadata$burn_in,
+      n_iter = run_metadata$n_iter,
+      thin_value = run_metadata$thin_value
+    )
+    
+    run_2pl <- run_metadata$run_2pl
+
+    # In reuse mode, DIC can be shown only if it was computed and saved during a previous run.
+    run_dic <- isTRUE(run_metadata$run_dic) &&
+      file.exists(file.path(results_dir, "dic_results.RData"))
+  }
+  
+  settings$run_mode <- run_mode
+  settings$reuse_existing_results <- run_mode == "reuse"
+  settings$original_run_mode <- if(run_mode == "reuse") run_metadata$run_mode else run_mode
+  settings$run_2pl <- run_2pl
+  settings$run_dic <- run_dic
+  settings$results_dir <- results_dir
+  settings$metadata_file <- metadata_file
+  
+  if(run_mode == "reuse") {
+    required_files <- c(
+      "run_metadata.RData",
+      "sampled_data.RData",
+      "rasch_results.RData"
+    )
+    
+    if(run_2pl) {
+      required_files <- c(required_files, "two_model_comparison_results.RData")
+    }
+    
+    missing_files <- required_files[!file.exists(file.path(results_dir, required_files))]
+    
+    if(length(missing_files) > 0) {
+      stop(
+        "Reuse mode was selected, but these files are missing in results_dir: ",
+        paste(missing_files, collapse = ", "),
+        ". Run the project once in fast or final mode first, or move the saved files into results_dir."
+      )
+    }
+  }
+  
+  settings
+}
+
+project_settings <- configure_project_run(
+  run_mode = run_mode,
+  run_2pl = run_2pl,
+  run_dic = run_dic,
+  results_dir = results_dir
+)
+
+list2env(project_settings, envir = .GlobalEnv)
+
+cat("Project running settings:\n")
+cat("These values control the sample size and the MCMC algorithm.\n\n")
+
+cat("Selected running mode:\n")
+print(run_mode)
+
+if(reuse_existing_results) {
+  cat("\nSaved results were originally created with this mode:\n")
+  print(original_run_mode)
+}
+
+cat("\nEstimate 2PL model?\n")
+print(run_2pl)
+
+cat("\nCompute DIC?\n")
+print(run_dic)
+
+cat("\nNumber of sampled students used in the model:\n")
+print(n_sample)
+
+cat("\nNumber of MCMC chains:\n")
+print(n_chains)
+
+cat("\nNumber of adaptation iterations:\n")
+print(n_adapt)
+
+cat("\nNumber of burn-in iterations discarded before saving posterior draws:\n")
+print(burn_in)
+
+cat("\nNumber of posterior iterations after burn-in:\n")
+print(n_iter)
+
+cat("\nThinning value used when saving MCMC draws:\n")
+print(thin_value)
+```
+
+# Load the dataset
+
+Our dataset was saved in a `.SAV`, and in this section, the SPSS `.SAV` file is loaded into R.
+
+The first commands are used only to inspect the dataset, in order to have an idea of which type of dataset we are dealing with.Here I check its dimensions and look at the names of all its variables.
+
+```{r load-data}
+raw_data <- read_sav(data_path)
+
+# Function to infer the type of each variable
+infer_variable_type <- function(x, var_name) {
+  
+  x_no_na <- x[!is.na(x)]
+  n_unique <- length(unique(x_no_na))
+  n_total <- length(x)
+  name_low <- tolower(var_name)
+  
+  if (n_unique == 0) {
+    return("Only missing values")
+  }
+  
+  if (grepl("codice|cod_|id|studente|scuola|plesso|classe", name_low) &&
+      n_unique > 20) {
+    return("Identifier / code")
+  }
+  
+  if (n_unique == 2) {
+    return("Binary variable")
+  }
+  
+  if (is.numeric(x) && n_unique <= 10) {
+    return("Discrete numerical / ordinal variable")
+  }
+  
+  if (is.numeric(x) && n_unique > 10) {
+    return("Numerical variable")
+  }
+  
+  if (is.character(x) || is.factor(x)) {
+    return("Categorical variable")
+  }
+  
+  if ("haven_labelled" %in% class(x)) {
+    return("Labelled SPSS variable")
+  }
+  
+  return("Other type")
+}
+
+# Function to show a few example values
+get_example_values <- function(x, max_values = 6) {
+  x_no_na <- x[!is.na(x)]
+  
+  if (length(x_no_na) == 0) {
+    return(NA)
+  }
+  
+  values <- unique(as.character(x_no_na))
+  paste(head(values, max_values), collapse = ", ")
+}
+
+# Function to check whether the variable has SPSS labels
+has_value_labels <- function(x) {
+  if (!is.null(attr(x, "labels"))) {
+    return("Yes")
+  } else {
+    return("No")
+  }
+}
+
+# Dataset dimensions
+dataset_dimensions <- data.frame(
+  rows = nrow(raw_data),
+  columns = ncol(raw_data)
+)
+
+dataset_dimensions
+
+# Summary table for all variables
+variable_summary <- data.frame(
+  variable_name = names(raw_data),
+  r_class = sapply(raw_data, function(x) paste(class(x), collapse = " / ")),
+  n_unique_values = sapply(raw_data, function(x) length(unique(x[!is.na(x)]))),
+  n_missing = sapply(raw_data, function(x) sum(is.na(x))),
+  has_spss_labels = sapply(raw_data, has_value_labels),
+  example_values = sapply(raw_data, get_example_values),
+  inferred_type = mapply(infer_variable_type, raw_data, names(raw_data)),
+  row.names = NULL
+)
+
+knitr::kable(variable_summary)
+```
+
+As we can see, the dataset contains student-level information, item-response variables, and the official INVALSI score. For the IRT model that we will use, we only need the binary item responses, so that's why we will delete all the other variables.  The official WLE score will however be kept separately for validation, because it is usefull to understand wheter we are predicting the student capacity properly or not.
+
+# Select item-response variables
+
+The item columns are the binary answers used in the IRT model.
+
+The selected variables are the Italian test items from sections A, B, C, D, E and F. These variables form the response matrix used by the Bayesian IRT models.
+
+`WLE_ITA_200` is kept separately because it is an external score, not an item response. It will be used later only to validate the Bayesian ability estimates.
+
+```{r select-items}
+item_cols <- c(
+  paste0("A", 1:11),
+  paste0("B", 1:11),
+  "C1",
+  paste0("D", 1:10),
+  paste0("E", 1:6),
+  paste0("F", 1:10)
+)
+
+missing_items <- setdiff(item_cols, names(raw_data))
+
+if(length(missing_items) > 0) {
+  stop("These item columns are missing: ", paste(missing_items, collapse = ", "))
+}
+
+Y_full <- raw_data %>%
+  select(all_of(item_cols)) %>%
+  as.data.frame()
+
+Y_full <- as.matrix(Y_full)
+storage.mode(Y_full) <- "numeric"
+
+wle_full <- raw_data$WLE_ITA_200
+
+cat("Dimension of the full item-response matrix Y_full:\n")
+cat("Rows = students; columns = selected Italian test items.\n")
+print(dim(Y_full))
+
+cat("\nSummary statistics of the item responses:\n")
+cat("These values refer to all 0/1 answers contained in the response matrix.\n")
+cat("0 = incorrect answer; 1 = correct answer.\n")
+print(summary(as.vector(Y_full)))
+
+cat("\nSummary statistics of WLE_ITA_200:\n")
+cat("This is the official INVALSI Italian ability score.\n")
+cat("It is not used inside the Bayesian model, but only later for validation.\n")
+print(summary(wle_full))
+```
+
+The output shows that the response matrix has 34,031 students and 49 selected items. The average item response is about 0.576, meaning that, across all students and all selected items, around 57.6% of answers are correct.
+
+The summary of `WLE_ITA_200` describes the distribution of the official INVALSI Italian score. This score will later be compared with the Bayesian estimate of student ability.
+
+# Check missing values
+
+Before running the Bayesian IRT models, it is important to check whether the item-response matrix contains missing values.
+
+Missing values are problematic because JAGS expects a clear response matrix for the Rasch and 2PL models. If some students have missing answers, the model becomes more complicated because we need to decide whether those values are truly missing, not administered, omitted, or missing by design.
+
+In this dataset, there are no missing values in the selected item-response matrix and no missing values in `WLE_ITA_200`. Therefore, no rows are removed.
+
+In our specific case, this section is kinda useless, because our data have already been cleaned by the the invalsi statistical offices, however I decided still to implement this chunk of code because, in case this code is going to be reused on other data, not as complete and clean as the one I used, it can be used for an easy initial data cleaning.
+
+```{r check-missing}
+cat("Number of missing values in the item-response matrix Y_full:\n")
+print(sum(is.na(Y_full)))
+
+cat("\nNumber of missing values in WLE_ITA_200:\n")
+print(sum(is.na(wle_full)))
+
+cat("\nNumber of incomplete rows:\n")
+incomplete_rows <- !complete.cases(Y_full) | is.na(wle_full)
+print(sum(incomplete_rows))
+
+if(sum(incomplete_rows) > 0) {
+  
+  cat("\nSome incomplete rows were found.\n")
+  cat("These rows will be removed before running the Bayesian models.\n")
+  
+  Y_full <- Y_full[!incomplete_rows, ]
+  wle_full <- wle_full[!incomplete_rows]
+  
+} else {
+  
+  cat("\nNo incomplete rows were found.\n")
+  cat("No rows are removed. The dataset is already complete for the selected variables.\n")
+  
+}
+
+cat("\nFinal dimension of Y_full after the missing-value check:\n")
+cat("Rows = students; columns = selected Italian test items.\n")
+print(dim(Y_full))
+
+cat("\nFinal summary of WLE_ITA_200 after the missing-value check:\n")
+print(summary(wle_full))
+```
+
+After this check, the dataset is ready for sampling and for the Bayesian IRT models. Since no missing values are present, the full selected response matrix is kept unchanged.
+
+# Sample students for MCMC
+
+The full dataset is large, and a Bayesian IRT model estimates one ability parameter for each student. Therefore, using all students would make the MCMC algorithm impossible to handle on a normal laptop.
+
+For this reason, I decided to use a random sample of students. This is a practical compromise: the model remains computationally feasible, but we still use real individual-level INVALSI data.
+
+```{r sample-students}
+# This function either creates a new random sample or reloads the previous one.
+# In fast/final mode, it samples students and saves the sample in sampled_data.RData.
+# In reuse mode, it reloads the exact same sample from sampled_data.RData.
+load_or_create_sample <- function(Y_full,
+                                  wle_full,
+                                  n_sample,
+                                  run_mode,
+                                  results_dir = ".") {
+  
+  sample_file <- file.path(results_dir, "sampled_data.RData")
+  
+  if(run_mode == "reuse") {
+    
+    load(sample_file, envir = environment())
+    
+    required_sample_objects <- c("sample_id", "Y", "wle", "N", "J", "n_sample")
+    missing_sample_objects <- required_sample_objects[!sapply(required_sample_objects, exists, envir = environment())]
+    
+    if(length(missing_sample_objects) > 0) {
+      stop(
+        "sampled_data.RData exists, but it is missing these objects: ",
+        paste(missing_sample_objects, collapse = ", "),
+        ". Re-run the project in fast or final mode with this updated file."
+      )
+    }
+    
+    cat("Reuse mode: sampled_data.RData loaded.\n")
+    cat("The same sample used in the previous MCMC run is used again.\n\n")
+    
+  } else {
+    
+    if(n_sample > nrow(Y_full)) {
+      n_sample <- nrow(Y_full)
+    }
+    
+    sample_id <- sample(1:nrow(Y_full), n_sample)
+    
+    Y <- Y_full[sample_id, , drop = FALSE]
+    wle <- wle_full[sample_id]
+    
+    N <- nrow(Y)
+    J <- ncol(Y)
+    n_sample <- N
+    
+    save(
+      sample_id,
+      Y,
+      wle,
+      N,
+      J,
+      n_sample,
+      file = sample_file
+    )
+    
+    cat("New sample created and saved in sampled_data.RData.\n\n")
+  }
+  
+  list(
+    sample_id = sample_id,
+    Y = Y,
+    wle = wle,
+    N = N,
+    J = J,
+    n_sample = N
+  )
+}
+
+sample_objects <- load_or_create_sample(
+  Y_full = Y_full,
+  wle_full = wle_full,
+  n_sample = n_sample,
+  run_mode = run_mode,
+  results_dir = results_dir
+)
+
+list2env(sample_objects, envir = .GlobalEnv)
+
+cat("Final response matrix used in the Bayesian models:\n")
+cat("Rows = sampled students; columns = selected Italian test items.\n")
+print(dim(Y))
+
+cat("\nNumber of sampled students used in the model:\n")
+print(N)
+
+cat("\nNumber of selected test items used in the model:\n")
+print(J)
+```
+
+The object `Y` is the final response matrix used in the Bayesian models.
+
+`N` is the number of sampled students.  
+`J` is the number of test items.
+
+# Exploratory Data Analysis
+
+Before estimating Bayesian models, it is better to take a look at raw data.
+
+The aim of this section is to understand:
+
+- how students performed on average;
+- which items were easier or harder;
+- whether the raw score is related to the official INVALSI score `WLE_ITA_200`.
+
+```{r eda-objects}
+# For the EDA, we use the full cleaned dataset.
+# This gives a more general description of student performance and item difficulty.
+Y_eda <- Y_full
+wle_eda <- wle_full
+
+# Student raw score: proportion of correct answers for each student
+student_score <- rowMeans(Y_eda)
+
+# Item score: proportion of students who answered each item correctly
+item_score <- colMeans(Y_eda)
+
+eda_students <- data.frame(
+  student_score = student_score,
+  WLE_ITA_200 = wle_eda
+)
+
+eda_items <- data.frame(
+  item = colnames(Y_eda),
+  proportion_correct = item_score
+)
+
+cat("Summary statistics of student raw scores:\n")
+cat("Each value is the proportion of correct answers for one student in the full cleaned dataset.\n")
+cat("For example, 0.60 means that the student answered 60% of the selected items correctly.\n")
+print(summary(student_score))
+
+cat("\nSummary statistics of item proportions correct:\n")
+cat("Each value is the proportion of students in the full cleaned dataset who answered one item correctly.\n")
+cat("A high value means that the item is easier; a low value means that the item is more difficult.\n")
+print(summary(item_score))
+
+cat("\nCorrelation between student raw score and WLE_ITA_200:\n")
+cat("This checks whether students with more correct answers also tend to have a higher official INVALSI score.\n")
+print(cor(student_score, wle_eda, use = "complete.obs"))
+```
+
+```{r eda-student-score}
+ggplot(eda_students, aes(x = student_score)) +
+  geom_histogram(bins = 100) +
+  labs(
+    title = "Distribution of student proportion correct",
+    x = "Proportion of correct answers",
+    y = "Number of students"
+  )
+```
+
+This graph shows how student raw scores are distributed. As you can see, since the distribution is concentrated on the right, many students answered most items correctly. If it was concentrated on the left, many students answered only a small proportion of items correctly (but is not our case).
+
+```{r eda-item-score}
+ggplot(eda_items, aes(x = reorder(item, proportion_correct), y = proportion_correct)) +
+  geom_col() +
+  geom_text(
+    aes(label = paste0(round(proportion_correct * 100, 1), "%")),
+    hjust = -0.1,
+    size = 3
+  ) +
+  coord_flip() +
+  scale_y_continuous(
+    limits = c(0, 1),
+    labels = function(x) paste0(x * 100, "%")
+  ) +
+  labs(
+    title = "Proportion of correct answers by item",
+    subtitle = "Text labels show the observed probability of a correct answer for each item",
+    x = "Item",
+    y = "Observed probability of correct answer"
+  )
+```
+
+This graph shows the observed easiness of each item. Items with high proportions are easier, while items with low proportions are more difficult.
+
+
+
+```{r eda-wle-counts}
+eda_students_count <- eda_students %>%
+  dplyr::count(student_score, WLE_ITA_200)
+
+ggplot(eda_students_count, aes(x = student_score, y = WLE_ITA_200, size = n)) +
+  geom_point(alpha = 0.5) +
+  geom_smooth(
+    data = eda_students,
+    aes(x = student_score, y = WLE_ITA_200),
+    method = "loess",
+    se = FALSE,
+    inherit.aes = FALSE
+  ) +
+  labs(
+    title = "Raw score vs official WLE score",
+    subtitle = "Point size represents the number of students with the same raw score and WLE score",
+    x = "Proportion correct",
+    y = "WLE_ITA_200",
+    size = "Number of students"
+  )
+```
+
+This graph compares the simple raw score with the official INVALSI score `WLE_ITA_200`. A positive relationship is expected, because students with a higher proportion of correct answers should generally have a higher official WLE score.
+
+Each point represents a combination of raw score and WLE score. Since many students can obtain the same number of correct answers, several students may overlap on the same point. For this reason, the size of the point represents the number of students with that same raw score and WLE score: larger points indicate that more students are concentrated there.
+
+The graph shows a clear positive relationship between raw score and WLE score. However, the relationship is not perfectly linear, especially at the lower and upper extremes. Since the aim of this section is only exploratory, we do not investigate the exact mathematical form of this relationship in detail.
+
+
+
+# Helper functions
+
+This section defines helper functions used later in the project.
+
+These functions are not part of the statistical model itself, but they are useful for organising the MCMC output and computing predictive measures.
+
+```{r helper-functions}
+sort_jags_cols <- function(cols) {
+  index <- as.numeric(gsub(".*\\[|\\]", "", cols))
+  cols[order(index)]
+}
+
+inv_logit <- function(x) {
+  1 / (1 + exp(-x))
+}
+
+clip_probs <- function(p) {
+  pmin(pmax(p, 1e-6), 1 - 1e-6)
+}
+
+rmse <- function(observed, predicted) {
+  sqrt(mean((observed - predicted)^2, na.rm = TRUE))
+}
+
+mae <- function(observed, predicted) {
+  mean(abs(observed - predicted), na.rm = TRUE)
+}
+
+jags_data <- list(
+  Y = Y,
+  N = N,
+  J = J
+)
+
+cat("Data list prepared for JAGS:\n")
+cat("The list contains the response matrix Y, the number of students N, and the number of items J.\n")
+print(names(jags_data))
+
+cat("\nNumber of students passed to JAGS:\n")
+print(jags_data$N)
+
+cat("\nNumber of items passed to JAGS:\n")
+print(jags_data$J)
+```
+
+The function `sort_jags_cols()` is used to order parameters correctly. Without this function, R may order parameters as `theta[1]`, `theta[10]`, `theta[100]`, instead of `theta[1]`, `theta[2]`, `theta[3]`.
+
+The function `inv_logit()` transforms linear predictions into probabilities between 0 and 1.
+
+The functions `rmse()` and `mae()` are used later to compare observed and predicted scores.
+
+# Model 1: Bayesian Rasch / 1PL model
+
+The Rasch model is:
+
+$$
+Y_{ij} \sim Bernoulli(p_{ij})
+$$
+
+$$
+logit(p_{ij}) = \theta_i - b_j
+$$
+
+where:
+
+\[
+\begin{aligned}
+\theta_i &= \text{ability of student } i, \\
+b_j &= \text{difficulty of item } j.
+\end{aligned}
+\]
+
+The interpretation of the model is:
+
+\[
+\begin{aligned}
+\theta_i > b_j &\Rightarrow p_{ij} > 0.5 
+&&\text{the student is likely to answer correctly}, \\[6pt]
+\theta_i < b_j &\Rightarrow p_{ij} < 0.5 
+&&\text{the student is likely to answer incorrectly}, \\[6pt]
+\theta_i = b_j &\Rightarrow p_{ij} = 0.5 
+&&\text{the student has a fifty-fifty probability of answering correctly}.
+\end{aligned}
+\]
+
+The Rasch model is the simplest IRT model used in this project. It estimates one latent ability parameter for each student and one difficulty parameter for each item. The model assumes that all items have the same discrimination power. Therefore, items can differ in difficulty, but they cannot differ in how strongly they separate weaker and stronger students.That will be the feature that the follow and more complex 2pl model will introduce
+
+```{r rasch-model}
+rasch_model <- "
+model {
+
+  for(i in 1:N) {
+
+    theta[i] ~ dnorm(0, 1)
+
+    for(j in 1:J) {
+
+      Y[i, j] ~ dbern(p[i, j])
+
+      logit(p[i, j]) <- theta[i] - b[j]
+
+      log_lik[i, j] <- Y[i, j] * log(p[i, j]) +
+                       (1 - Y[i, j]) * log(1 - p[i, j])
+
+      dev_contribution[i, j] <- -2 * log_lik[i, j]
+
+    }
+
+    student_deviance[i] <- sum(dev_contribution[i, 1:J])
+  }
+
+  for(j in 1:J) {
+
+    b[j] ~ dnorm(0, 1)
+
+  }
+
+  total_deviance <- sum(student_deviance[1:N])
+}
+"
+
+writeLines(rasch_model, "rasch_model.txt")
+```
+
+# Run the Rasch model
+
+In this section, we estimate the Rasch / 1PL model using MCMC. The goal is to obtain posterior samples for the latent student abilities `theta` and the item difficulties `b`.
+
+In the Bayesian framework, the posterior distribution is proportional to the likelihood times the prior. The likelihood tells us how well a given combination of `theta` and `b` explains the observed response matrix, while the priors define our initial assumptions about the parameters.
+
+Since the posterior distribution of the Rasch model is too complex to compute analytically, we use MCMC through JAGS. MCMC generates a sequence of dependent samples. Values of `theta` and `b` that have higher posterior probability are visited more often by the chain. In this way, after convergence, the collected samples approximate the posterior distribution of the model parameters.
+
+The posterior samples can then be used to compute posterior means, credible intervals and convergence diagnostics for both student abilities and item difficulties.
+
+```{r rasch-inits}
+if(!reuse_existing_results) {
+  inits_rasch <- vector("list", n_chains)
+  
+  for(chain in 1:n_chains) {
+    inits_rasch[[chain]] <- list(
+      theta = rnorm(N, 0, 0.2),
+      b = rnorm(J, 0, 0.2)
+    )
+  }
+}
+```
+
+```{r run-rasch, cache=TRUE}
+if(reuse_existing_results) {
+
+  load(file.path(results_dir, "rasch_results.RData"), envir = .GlobalEnv)
+  cat("Reuse mode: Rasch / 1PL posterior samples loaded from rasch_results.RData.\n")
+
+} else {
+
+  if(run_dic) {
+    load.module("dic")
+  }
+
+  jags_rasch <- jags.model(
+    file = "rasch_model.txt",
+    data = jags_data,
+    inits = inits_rasch,
+    n.chains = n_chains,
+    n.adapt = n_adapt
+  )
+
+  update(jags_rasch, burn_in)
+
+  samples_rasch <- coda.samples(
+    model = jags_rasch,
+    variable.names = c("theta", "b"),
+    n.iter = n_iter,
+    thin = thin_value
+  )
+
+  if(run_dic) {
+    deviance_trace_rasch <- coda.samples(
+      model = jags_rasch,
+      variable.names = c("total_deviance"),
+      n.iter = n_iter,
+      thin = thin_value
+    )
+
+    dic_rasch <- dic.samples(
+      model = jags_rasch,
+      n.iter = n_iter,
+      thin = thin_value,
+      type = "pD"
+    )
+  }
+}
+```
+
+# Rasch MCMC diagnostics
+
+Before interpreting the posterior estimates, it is important to check whether the MCMC algorithm worked properly. In Bayesian analysis, we do not observe the posterior distribution directly. Instead, we approximate it using MCMC simulation. Therefore, convergence diagnostics are necessary to check whether the chains are stable and whether the saved draws are reliable.
+```{r rasch-diagnostics}
+cat("Posterior summary of the Rasch model parameters:\n")
+cat("This table reports posterior means, standard deviations, and credible intervals for theta and b.\n")
+cat("theta parameters represent student abilities.\n")
+cat("b parameters represent item difficulties.\n\n")
+print(summary(samples_rasch))
+
+diagnostic_params_rasch <- c(
+  "b[1]", "b[2]", "b[3]", "b[4]", "b[5]", "b[6]",
+  "theta[1]", "theta[2]", "theta[3]", "theta[4]", "theta[5]", "theta[6]"
+)
+
+cat("\nSelected parameters used for convergence diagnostics:\n")
+cat("We do not inspect all theta and b parameters because there are many of them.\n")
+cat("Instead, we inspect a small set of item difficulties and student abilities.\n\n")
+print(diagnostic_params_rasch)
+
+gelman_rasch <- gelman.diag(samples_rasch[, diagnostic_params_rasch])
+ess_rasch <- effectiveSize(samples_rasch[, diagnostic_params_rasch])
+
+cat("\nGelman-Rubin convergence diagnostic for selected Rasch parameters:\n")
+cat("The Gelman-Rubin diagnostic compares the MCMC chains.\n")
+cat("Values close to 1 indicate that the chains have converged to the same posterior distribution.\n")
+cat("As a practical rule, values below 1.05 are very good, and values below 1.10 are usually acceptable.\n\n")
+print(gelman_rasch)
+
+max_gelman_upper <- max(gelman_rasch$psrf[, "Upper C.I."])
+
+cat("\nInterpretation of the Gelman-Rubin diagnostic for selected parameters:\n")
+
+if(max_gelman_upper < 1.05) {
+  cat("The largest upper confidence interval among selected parameters is", round(max_gelman_upper, 3), ".\n")
+  cat("This is very close to 1, so the selected Rasch parameters show very good convergence.\n")
+} else if(max_gelman_upper < 1.10) {
+  cat("The largest upper confidence interval among selected parameters is", round(max_gelman_upper, 3), ".\n")
+  cat("This is acceptable, although convergence should still be checked with traceplots.\n")
+} else {
+  cat("The largest upper confidence interval among selected parameters is", round(max_gelman_upper, 3), ".\n")
+  cat("This may indicate convergence problems. More iterations or better starting values may be needed.\n")
+}
+
+cat("\nEffective sample size for selected Rasch parameters:\n")
+cat("The effective sample size measures how much independent information is contained in the MCMC draws.\n")
+cat("Because MCMC draws are autocorrelated, the effective sample size is usually lower than the total number of saved draws.\n")
+cat("Higher values are better.\n\n")
+print(round(ess_rasch, 2))
+
+saved_draws_per_chain <- niter(samples_rasch)
+number_of_chains <- nchain(samples_rasch)
+total_saved_draws <- saved_draws_per_chain * number_of_chains
+
+cat("\nNumber of saved posterior draws:\n")
+cat("Saved draws per chain:", saved_draws_per_chain, "\n")
+cat("Number of chains:", number_of_chains, "\n")
+cat("Total saved draws:", total_saved_draws, "\n")
+
+cat("\nInterpretation of the effective sample size for selected parameters:\n")
+cat("The maximum possible effective sample size is approximately equal to the total number of saved draws.\n")
+cat("Here, the total number of saved draws is", total_saved_draws, ".\n")
+cat("If an effective sample size is close to this value, the MCMC draws contain almost as much information as independent draws.\n")
+cat("If an effective sample size is much lower, the chain has more autocorrelation for that parameter.\n\n")
+
+min_ess <- min(ess_rasch)
+max_ess <- max(ess_rasch)
+
+cat("Minimum effective sample size among selected parameters:", round(min_ess, 2), "\n")
+cat("Maximum effective sample size among selected parameters:", round(max_ess, 2), "\n")
+
+if(min_ess > 400) {
+  cat("All selected parameters have a good effective sample size for this run.\n")
+} else if(min_ess > 200) {
+  cat("The effective sample sizes are acceptable.\n")
+} else {
+  cat("Some effective sample sizes are low. More MCMC iterations may be useful.\n")
+}
+
+# General diagnostics for all Rasch parameters
+
+all_params_rasch <- varnames(samples_rasch)
+
+all_params_rasch <- all_params_rasch[
+  grepl("^b\\[", all_params_rasch) |
+  grepl("^theta\\[", all_params_rasch)
+]
+
+cat("\nGeneral diagnostics for all Rasch parameters:\n")
+cat("The following diagnostics are computed using all monitored item difficulties and student abilities.\n")
+cat("This gives a broader picture than the selected subset used above.\n\n")
+
+gelman_all_rasch <- gelman.diag(
+  samples_rasch[, all_params_rasch],
+  multivariate = FALSE
+)
+
+gelman_all_psrf <- gelman_all_rasch$psrf
+
+max_gelman_upper_all <- max(gelman_all_psrf[, "Upper C.I."], na.rm = TRUE)
+max_gelman_upper_all_param <- rownames(gelman_all_psrf)[
+  which.max(gelman_all_psrf[, "Upper C.I."])
+]
+
+cat("Highest Gelman-Rubin upper confidence interval among all Rasch parameters:\n")
+cat(max_gelman_upper_all_param, "=", round(max_gelman_upper_all, 3), "\n")
+
+if(max_gelman_upper_all < 1.05) {
+  cat("Overall, the Rasch model shows very good convergence across all monitored parameters.\n")
+} else if(max_gelman_upper_all < 1.10) {
+  cat("Overall, convergence is acceptable, although some parameters should still be checked carefully.\n")
+} else {
+  cat("At least one parameter may have convergence problems. More iterations or better starting values may be useful.\n")
+}
+
+ess_all_rasch <- effectiveSize(samples_rasch[, all_params_rasch])
+
+min_ess_all <- min(ess_all_rasch, na.rm = TRUE)
+max_ess_all <- max(ess_all_rasch, na.rm = TRUE)
+
+min_ess_all_param <- names(ess_all_rasch)[which.min(ess_all_rasch)]
+max_ess_all_param <- names(ess_all_rasch)[which.max(ess_all_rasch)]
+
+cat("\nEffective sample size among all Rasch parameters:\n")
+cat("Lowest effective sample size:", min_ess_all_param, "=", round(min_ess_all, 2), "\n")
+cat("Highest effective sample size:", max_ess_all_param, "=", round(max_ess_all, 2), "\n")
+
+if(min_ess_all > 400) {
+  cat("All Rasch parameters have a good effective sample size for this run.\n")
+} else if(min_ess_all > 200) {
+  cat("The effective sample sizes are generally acceptable, although some parameters are less efficiently sampled.\n")
+} else {
+  cat("Some Rasch parameters have low effective sample size. More MCMC iterations may be useful.\n")
+}
+```
+
+```{r rasch-trace-b}
+# Traceplots are used to check the behaviour of the MCMC chains over iterations.
+# Each line shows how the sampled values of a parameter move during the simulation.
+# For the Rasch model, b[j] represents the difficulty of item j.
+# A good traceplot should look like a stable random cloud, without clear trends.
+# If the chains mix well and move around the same area, this suggests good convergence.
+# If the chains are separated, stuck, or show trends, the MCMC may not have converged well.
+
+traceplot(samples_rasch[, c("b[1]", "b[2]", "b[3]", "b[4]", "b[5]", "b[6]")])
+```
+
+The traceplots above show the MCMC chains for the first six item difficulty parameters. Each curve represents the sampled posterior values of one parameter across iterations. A good traceplot should fluctuate around a stable region without a visible upward or downward trend, and this is basically what we are seeing here. If the chains overlap and mix well, this suggests that the MCMC algorithm is exploring the posterior distribution properly. If the chains remain separated or show long trends, convergence may be problematic.
+
+```{r rasch-trace-theta}
+# These traceplots show the MCMC chains for the first six student ability parameters.
+# In the Rasch model, theta[i] represents the latent ability of student i.
+# The purpose is to check whether the posterior samples are stable across iterations.
+# Good traceplots should fluctuate around a constant level, with no increasing or decreasing trend.
+# If the chains overlap and mix well, this indicates that the MCMC is exploring the posterior distribution properly.
+# If the plot shows poor mixing, long trends, or chains moving in different regions, the estimates may be unreliable.
+
+traceplot(samples_rasch[, c("theta[1]", "theta[2]", "theta[3]", "theta[4]", "theta[5]", "theta[6]")])
+```
+
+The traceplots above show the MCMC chains for the first six student ability parameters. These plots are useful because the Rasch model estimates one latent ability value for each student. Stable and well-mixed chains indicate that the posterior estimates of student ability are reliable for the selected parameters. Since there are many ability parameters, i have shown here only a small subset is shown for visual inspection (the ability of only the first 6 students).
+
+# Rasch posterior estimates
+
+This section extracts the posterior means of student abilities and item difficulties.
+Section 13 checked whether the MCMC samples were reliable.
+Here, we transform those samples into clean student-level and item-level tables, which will be used in the following interpretation, plots, rankings, and comparisons.
+
+```{r rasch-posterior-means}
+rasch_matrix <- as.matrix(samples_rasch)
+
+theta_cols <- sort_jags_cols(grep("^theta\\[", colnames(rasch_matrix), value = TRUE))
+b_cols <- sort_jags_cols(grep("^b\\[", colnames(rasch_matrix), value = TRUE))
+
+theta_hat_1pl <- colMeans(rasch_matrix[, theta_cols])
+b_hat_1pl <- colMeans(rasch_matrix[, b_cols])
+
+# Raw scores and item proportions must be computed on the same sampled data used by the model
+student_score_1pl <- rowMeans(Y)
+item_score_1pl <- colMeans(Y)
+
+
+results_students_1pl <- data.frame(
+  student_id = sample_id,
+  theta_hat_1pl = theta_hat_1pl,
+  raw_score = student_score_1pl,
+  WLE_ITA_200 = wle
+)
+
+results_items_1pl <- data.frame(
+  item = colnames(Y),
+  b_hat_1pl = b_hat_1pl,
+  proportion_correct = item_score_1pl
+)
+
+cat("First rows of the student-level Rasch results:\n")
+cat("Each row is one sampled student, with estimated ability, raw score, and WLE score.\n")
+print(head(results_students_1pl))
+
+cat("\nFirst rows of the item-level Rasch results:\n")
+cat("Each row is one item, with estimated difficulty and observed proportion correct.\n")
+print(head(results_items_1pl))
+```
+
+# Interpret Rasch item difficulty
+
+In the Rasch model:
+
+- high `b_hat_1pl` = difficult item;
+- low `b_hat_1pl` = easy item.
+
+The observed proportion correct has the opposite interpretation:
+
+- high proportion correct = easy item;
+- low proportion correct = difficult item.
+
+Therefore, we expect a negative correlation between estimated difficulty and observed proportion correct.
+
+```{r rasch-item-results}
+# We add two ranking columns to compare item difficulty in two different ways:
+# 1. Ranking based on Bayesian Rasch difficulty b_hat_1pl.
+# 2. Ranking based on the observed proportion of correct answers.
+# For b_hat_1pl, lower values mean easier items.
+# For proportion_correct, higher values mean easier items.
+
+results_items_1pl <- results_items_1pl %>%
+  mutate(
+    rank_b_hat_easy_to_hard = rank(b_hat_1pl, ties.method = "first"),
+    rank_prop_easy_to_hard = rank(-proportion_correct, ties.method = "first"),
+    rank_difference = rank_b_hat_easy_to_hard - rank_prop_easy_to_hard,
+    abs_rank_difference = abs(rank_difference)
+  ) %>%
+  arrange(rank_b_hat_easy_to_hard)
+
+cor_b1_itemscore <- cor(
+  results_items_1pl$b_hat_1pl,
+  results_items_1pl$proportion_correct
+)
+
+cor_rank_b_prop <- cor(
+  results_items_1pl$rank_b_hat_easy_to_hard,
+  results_items_1pl$rank_prop_easy_to_hard,
+  method = "spearman"
+)
+
+cat("Correlation between Rasch difficulty and observed item proportion correct:\n")
+cat("This value should usually be negative: difficult items should have lower proportions correct.\n")
+print(cor_b1_itemscore)
+
+cat("\nSpearman correlation between the two item difficulty rankings:\n")
+cat("This value should usually be positive and high if the two rankings are similar.\n")
+print(cor_rank_b_prop)
+
+cat("\nItem-level Rasch results ordered from easiest to hardest according to b_hat_1pl:\n")
+print(
+  results_items_1pl %>%
+    select(
+      item,
+      b_hat_1pl,
+      proportion_correct,
+      rank_b_hat_easy_to_hard,
+      rank_prop_easy_to_hard,
+      rank_difference,
+      abs_rank_difference
+    )
+)
+```
+
+The table compares the model-based difficulty ranking with the raw observed difficulty ranking. The column `rank_b_hat_easy_to_hard` ranks items using the posterior mean Rasch difficulty: rank 1 is the easiest item. The column `rank_prop_easy_to_hard` ranks items using the observed proportion correct: the item with the highest proportion correct receives rank 1 because it was the easiest in the raw data. If the Rasch model is coherent with the observed answers, the two rankings should be very similar. The column `abs_rank_difference` helps identify items where the two approaches disagree more strongly.  As you can see, the two approaches never disagree, and this shows actually how much b_hat is close to the difficulty of the question and explain why the spearman index is 1.
+
+```{r rasch-item-difficulty-plot}
+eps <- 1e-6
+
+results_items_1pl <- results_items_1pl %>%
+  mutate(
+    proportion_correct_safe = pmin(pmax(proportion_correct, eps), 1 - eps),
+    observed_difficulty_from_prop = -qlogis(proportion_correct_safe),
+    difficulty_difference = b_hat_1pl - observed_difficulty_from_prop
+  ) %>%
+  arrange(b_hat_1pl) %>%
+  mutate(item_ordered = factor(item, levels = item))
+
+plot_items_1pl <- results_items_1pl %>%
+  select(item_ordered, b_hat_1pl, observed_difficulty_from_prop) %>%
+  pivot_longer(
+    cols = c(b_hat_1pl, observed_difficulty_from_prop),
+    names_to = "measure",
+    values_to = "difficulty_value"
+  ) %>%
+  mutate(
+    measure = recode(
+      measure,
+      b_hat_1pl = "Bayesian Rasch difficulty",
+      observed_difficulty_from_prop = "Observed difficulty from proportion correct"
+    )
+  )
+
+difference_labels_1pl <- results_items_1pl %>%
+  mutate(
+    measure = "Bayesian Rasch difficulty",
+    difference_label = round(difficulty_difference, 2)
+  )
+
+ggplot(plot_items_1pl, aes(x = item_ordered, y = difficulty_value, fill = measure)) +
+  geom_col(position = position_dodge(width = 0.8), width = 0.7) +
+  geom_text(
+    data = difference_labels_1pl,
+    aes(
+      x = item_ordered,
+      y = b_hat_1pl,
+      label = difference_label,
+      group = measure
+    ),
+    position = position_dodge(width = 0.8),
+    hjust = ifelse(difference_labels_1pl$b_hat_1pl >= 0, -0.1, 1.1),
+    size = 2.8,
+    inherit.aes = FALSE
+  ) +
+  coord_flip() +
+  scale_y_continuous(expand = expansion(mult = c(0.15, 0.25))) +
+  labs(
+    title = "Bayesian Rasch difficulty compared with observed item difficulty",
+    subtitle = "Text labels show the numerical difference: Bayesian Rasch difficulty minus observed difficulty",
+    x = "Item",
+    y = "Difficulty value",
+    fill = "Measure"
+  ) +
+  theme(
+    legend.position = "bottom"
+  )
+```
+
+This graph compares the posterior mean difficulty estimated by the Bayesian Rasch model with an observed difficulty index derived from the proportion of correct answers. Since `proportion_correct` and `b_hat_1pl` are not originally on the same scale, the observed proportion was transformed using `-logit(proportion_correct)`. After this transformation, both measures have the same interpretation: lower values indicate easier items, while higher values indicate more difficult items.
+
+The graph also reports, at the end of each Bayesian Rasch bar, the difference between the two measures. This difference is calculated as `Bayesian Rasch difficulty - observed difficulty`. Therefore, a positive difference means that the Rasch model estimates the item as more difficult than what is suggested by the observed proportion correct. A negative difference means that the Rasch model estimates the item as easier than the observed difficulty index.
+
+Overall, the Bayesian Rasch estimates and the observed difficulty values follow a similar pattern, meaning that the model and the raw data generally agree on which items are easier and which items are harder. However, the differences shown on the graph make clear that the model does not simply reproduce the observed proportions. For some items, the difference is small, so the model-based difficulty is very close to the raw-data difficulty. For other items, the difference is larger, meaning that the Rasch model adjusts the difficulty estimate more substantially.
+
+This happens because the Rasch model estimates item difficulty using the whole response pattern of the students, not only the percentage of correct answers for each single item. As a result, the model-based difficulty can differ from the simple observed difficulty, especially for items where the response pattern contains additional information that is not captured by the raw proportion correct alone.
+
+```{r rasch-item-difficulty-scatter, fig.width=10, fig.height=7}
+ggplot(results_items_1pl, aes(x = proportion_correct, y = b_hat_1pl, label = item)) +
+  geom_point(size = 2) +
+  geom_smooth(method = "lm", se = FALSE) +
+  geom_label_repel(
+    size = 3,
+    max.overlaps = Inf,
+    box.padding = 0.35,
+    point.padding = 0.25,
+    min.segment.length = 0,
+    segment.size = 0.3
+  ) +
+  labs(
+    title = "Observed item performance vs Rasch difficulty",
+    x = "Observed proportion correct",
+    y = "Posterior mean difficulty"
+  ) +
+  theme(
+    plot.margin = margin(10, 20, 10, 10)
+  )
+```
+
+This scatter plot compares the observed proportion correct with the estimated Rasch difficulty for each item. A negative relationship is expected: items answered correctly by many students should have low estimated difficulty, while items answered correctly by few students should have high estimated difficulty. Therefore, this plot is a simple visual check that the Bayesian difficulty estimates are coherent with the raw item performance.
+
+# Rasch item characteristic curves
+
+Item characteristic curves show the relationship between student ability and the probability of answering an item correctly. In the Rasch model, all items have the same discrimination, so the curves have the same general steepness. What changes from item to item is mainly the horizontal position of the curve, which depends on item difficulty.
+
+```{r rasch-icc-selected-items}
+# Select representative Rasch items.
+selected_items_1pl <- bind_rows(
+  results_items_1pl %>%
+    slice_min(b_hat_1pl, n = 1, with_ties = FALSE) %>%
+    mutate(type = "Easiest item"),
+  results_items_1pl %>%
+    slice_max(b_hat_1pl, n = 1, with_ties = FALSE) %>%
+    mutate(type = "Hardest item"),
+  results_items_1pl %>%
+    mutate(abs_difficulty = abs(b_hat_1pl)) %>%
+    slice_min(abs_difficulty, n = 1, with_ties = FALSE) %>%
+    select(-abs_difficulty) %>%
+    mutate(type = "Average-difficulty item"),
+  results_items_1pl %>%
+    mutate(abs_from_half = abs(proportion_correct - 0.5)) %>%
+    slice_min(abs_from_half, n = 1, with_ties = FALSE) %>%
+    select(-abs_from_half) %>%
+    mutate(type = "Most balanced observed item")
+) %>%
+  distinct(item, .keep_all = TRUE) %>%
+  mutate(
+    item_label = paste0(item, " - ", type),
+    difficulty_label = paste0("b = ", round(b_hat_1pl, 2))
+  )
+
+theta_grid_1pl <- seq(-4, 4, length.out = 200)
+
+icc_data_1pl <- selected_items_1pl %>%
+  tidyr::crossing(theta = theta_grid_1pl) %>%
+  mutate(
+    probability_correct = plogis(theta - b_hat_1pl)
+  )
+
+ggplot(icc_data_1pl, aes(x = theta, y = probability_correct, group = item_label)) +
+  geom_line(linewidth = 1) +
+  geom_hline(yintercept = 0.5, linetype = "dashed") +
+  geom_vline(
+    data = selected_items_1pl,
+    aes(xintercept = b_hat_1pl),
+    linetype = "dashed",
+    inherit.aes = FALSE
+  ) +
+  geom_text(
+    data = selected_items_1pl,
+    aes(x = b_hat_1pl, y = 0.55, label = difficulty_label),
+    inherit.aes = FALSE,
+    angle = 90,
+    vjust = -0.5,
+    size = 3
+  ) +
+  labs(
+    title = "Item characteristic curves for selected Rasch items",
+    subtitle = "The dashed lines show the item difficulty, where the probability of a correct answer is 50%",
+    x = "Student ability",
+    y = "Probability of correct answer"
+  ) +
+  facet_wrap(~ item_label)
+```
+
+**Interpretation of the Rasch item characteristic curves.**  
+These curves show how the probability of answering an item correctly changes as student ability increases. The x-axis represents student ability, while the y-axis represents the predicted probability of a correct answer. In the Rasch model, the probability depends on the difference between student ability and item difficulty. When student ability is equal to item difficulty, the predicted probability of a correct answer is 0.5.
+
+Curves shifted to the left represent easier items, because even students with lower ability have a relatively high probability of answering correctly. Curves shifted to the right represent more difficult items, because students need a higher ability level to reach the same probability of success. Therefore, item difficulty is mainly represented by the horizontal position of the curve.
+
+The steepness of the curve represents how strongly an item separates students with lower and higher ability. However, in the Rasch model, all items are assumed to have the same discrimination level. For this reason, the curves have the same basic steepness and differ mainly in their horizontal position. This is why the graph is especially useful for visualizing item difficulty rather than differences in item discrimination.
+
+# Rasch item information curves
+
+Item information curves show where an item is most useful for estimating student ability. In the Rasch model, information is highest around the difficulty level of the item. This means that an item is most informative for students whose ability is close to that item's difficulty.
+
+```{r rasch-information-selected-items}
+# For the Rasch model, item discrimination is fixed to 1.
+# Therefore, item information is p * (1 - p).
+# Information is highest when the predicted probability is close to 0.5.
+# This happens when student ability is equal to item difficulty.
+
+information_data_1pl <- selected_items_1pl %>%
+  tidyr::crossing(theta = theta_grid_1pl) %>%
+  mutate(
+    probability_correct = plogis(theta - b_hat_1pl),
+    item_information = probability_correct * (1 - probability_correct),
+    item_label = paste0(item, " - ", type)
+  )
+
+difficulty_labels_1pl <- selected_items_1pl %>%
+  mutate(
+    item_label = paste0(item, " - ", type),
+    difficulty_label = paste0("b = ", round(b_hat_1pl, 2))
+  )
+
+ggplot(information_data_1pl, aes(x = theta, y = item_information, group = item_label)) +
+  geom_line(linewidth = 1) +
+  geom_vline(
+    data = difficulty_labels_1pl,
+    aes(xintercept = b_hat_1pl),
+    linetype = "dashed",
+    inherit.aes = FALSE
+  ) +
+  geom_text(
+    data = difficulty_labels_1pl,
+    aes(
+      x = b_hat_1pl,
+      y = max(information_data_1pl$item_information),
+      label = difficulty_label
+    ),
+    angle = 90,
+    vjust = -0.4,
+    hjust = 1.1,
+    size = 3,
+    inherit.aes = FALSE
+  ) +
+  labs(
+    title = "Item information curves for selected Rasch items",
+    subtitle = "Dashed lines show the estimated difficulty of each item",
+    x = "Student ability",
+    y = "Item information"
+  ) +
+  facet_wrap(~ item_label)
+```
+
+**Interpretation of the Rasch item information curves.**  
+These curves show at which ability levels each item is most useful for estimating student ability. In the Rasch model, item information is calculated as `p * (1 - p)`, where `p` is the predicted probability of answering correctly. Information is highest when this probability is close to 0.5, because this is the point where the item is neither too easy nor too difficult for the student. At this point, the response is most informative for understanding whether the student's ability is slightly above or below the item's difficulty.
+
+The dashed vertical line shows the estimated difficulty of each item. The peak of each curve is located around this difficulty value. This means that each item is most informative for students whose ability is close to the item difficulty. Easier items, such as A3, provide more information for lower-ability students. Harder items, such as E6, provide more information for higher-ability students. Average-difficulty items, such as F6, provide more information around the middle of the ability scale.
+
+Since this is a Rasch model, all items are assumed to have the same discrimination. Therefore, the information curves have a similar shape and approximately the same maximum height. For this reason, in the 1PL/Rasch model, the most important aspect is not how high the peak is, but where the peak is located on the ability scale. The graph mainly tells us which type of student each item is most informative for.
+
+This would be different in a 2PL model, where each item has its own discrimination parameter. In that case, the height of the information curve would also matter, because more discriminating items would have higher peaks and would therefore provide more information. In other words, in the Rasch model items mainly differ by the location of their information peak, while in the 2PL model items can also differ by how much maximum information they provide.
+
+
+# Validate Rasch ability with WLE
+
+The model does not use `WLE_ITA_200` during estimation. Therefore, WLE can be used as an external validation score.
+
+If the estimated ability is meaningful, `theta_hat_1pl` should be positively correlated with `WLE_ITA_200`.
+
+```{r rasch-wle-validation}
+cor_theta1_wle <- cor(
+  results_students_1pl$theta_hat_1pl,
+  results_students_1pl$WLE_ITA_200,
+  use = "complete.obs"
+)
+
+cor_theta1_raw <- cor(
+  results_students_1pl$theta_hat_1pl,
+  results_students_1pl$raw_score,
+  use = "complete.obs"
+)
+
+cat("Correlation between Rasch ability estimate and WLE_ITA_200:\n")
+cat("A positive value means that the Bayesian ability estimate is coherent with the official INVALSI score.\n")
+print(cor_theta1_wle)
+
+cat("\nCorrelation between Rasch ability estimate and raw proportion correct:\n")
+cat("A high positive value is expected because both variables measure student performance.\n")
+print(cor_theta1_raw)
+```
+
+```{r rasch-theta-wle-plot}
+ggplot(results_students_1pl, aes(x = theta_hat_1pl, y = WLE_ITA_200)) +
+  geom_point(alpha = 0.4) +
+  geom_smooth(method = "lm", se = FALSE) +
+  labs(
+    title = "Rasch ability estimate vs official WLE score",
+    x = "Posterior mean theta from Rasch model",
+    y = "WLE_ITA_200"
+  )
+```
+
+This graph compares the Bayesian Rasch ability estimate with the official INVALSI `WLE_ITA_200` score. The model does not use `WLE_ITA_200` during estimation, so this comparison works as an external validation check. A positive and approximately linear relationship indicates that the Bayesian ability estimates are coherent with the official INVALSI proficiency score. The two variables are not expected to be identical because they are estimated using different methods and are expressed on different scales.
+
+```{r rasch-theta-raw-plot}
+ggplot(results_students_1pl, aes(x = theta_hat_1pl, y = raw_score)) +
+  geom_point(alpha = 0.4) +
+  geom_smooth(method = "lm", se = FALSE) +
+  labs(
+    title = "Rasch ability estimate vs raw proportion correct",
+    x = "Posterior mean theta from Rasch model",
+    y = "Raw proportion correct"
+  )
+```
+
+This graph compares the posterior mean ability estimated by the Rasch model with the raw proportion of correct answers obtained by each student. The relationship is strongly positive, as expected: students with higher estimated ability also tend to have a higher proportion of correct answers. This confirms that the Rasch ability parameter is coherent with the observed performance in the test. However, the relationship is not perfectly identical because the Rasch model does not only count the number of correct answers, but estimates ability by considering the difficulty structure of the items.
+
+```{r rasch-theta-distribution-binned}
+# This plot shows the distribution of the estimated student abilities.
+# We divide theta_hat_1pl into intervals of width 0.18.
+# The height of each bar tells us how many students fall inside that ability interval.
+
+theta_breaks <- seq(-4, 4, by = 0.18)
+
+results_students_1pl_binned <- results_students_1pl %>%
+  mutate(
+    theta_bin = cut(
+      theta_hat_1pl,
+      breaks = theta_breaks,
+      include.lowest = TRUE,
+      right = FALSE
+    )
+  ) %>%
+  filter(!is.na(theta_bin))
+
+ggplot(results_students_1pl_binned, aes(x = theta_bin)) +
+  geom_bar() +
+  geom_text(
+    stat = "count",
+    aes(
+      label = after_stat(
+        paste0(round(count / sum(count) * 100, 1), "%")
+      )
+    ),
+    vjust = -0.3,
+    size = 3
+  ) +
+  labs(
+    title = "Distribution of students by estimated Rasch ability",
+    x = "Posterior mean theta interval",
+    y = "Number of students"
+  ) +
+  scale_y_continuous(
+    expand = expansion(mult = c(0, 0.10))
+  ) +
+  theme(
+    axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1)
+  )
+```
+
+This plot shows the distribution of the posterior mean Rasch ability estimates across students. Each bar represents an interval of theta values, and the height of each bar indicates how many students fall within that ability range. This graph is useful to understand whether most students are concentrated around the average ability level and whether there are many very low-ability or very high-ability students.
+
+# Rasch posterior predictive check
+
+Posterior predictive checking means:
+
+1. estimate the model;
+2. simulate fake answers from the fitted model;
+3. compare fake data with real data.
+
+If the model fits well, the fake data should look similar to the observed data.
+
+```{r rasch-posterior-predictive}
+p_hat_1pl <- matrix(NA, nrow = N, ncol = J)
+
+for(j in 1:J) {
+  p_hat_1pl[, j] <- inv_logit(theta_hat_1pl - b_hat_1pl[j])
+}
+
+Y_rep_1pl <- matrix(
+  rbinom(N * J, size = 1, prob = as.vector(p_hat_1pl)),
+  nrow = N,
+  ncol = J
+)
+
+observed_student_score <- rowMeans(Y)
+expected_student_score_1pl <- rowMeans(p_hat_1pl)
+replicated_student_score_1pl <- rowMeans(Y_rep_1pl)
+
+observed_item_score <- colMeans(Y)
+expected_item_score_1pl <- colMeans(p_hat_1pl)
+replicated_item_score_1pl <- colMeans(Y_rep_1pl)
+
+ppc_students_1pl <- data.frame(
+  observed = observed_student_score,
+  expected_prediction = expected_student_score_1pl,
+  replicated = replicated_student_score_1pl
+)
+
+ppc_items_1pl <- data.frame(
+  item = colnames(Y),
+  observed = observed_item_score,
+  expected_prediction = expected_item_score_1pl,
+  replicated = replicated_item_score_1pl
+)
+```
+
+```{r rasch-ppc-students}
+ggplot(ppc_students_1pl, aes(x = observed, y = expected_prediction)) +
+  geom_point(alpha = 0.4) +
+  geom_abline(intercept = 0, slope = 1, linetype = "dashed") +
+  labs(
+    title = "Posterior predictive check: student scores, Rasch model",
+    x = "Observed proportion correct",
+    y = "Expected predicted proportion correct"
+  )
+```
+
+Each point represents one student. The x-axis shows the observed proportion of correct answers obtained by the student, while the y-axis shows the expected proportion of correct answers predicted by the Rasch model.
+
+The dashed diagonal line represents perfect agreement between observed and predicted performance. If a point lies exactly on this line, it means that the model prediction is equal to the student’s observed score. Points close to the line indicate that the model is able to reproduce student performance quite well.
+
+Overall, most points are close to the diagonal line, so the Rasch model seems to capture the general pattern of student ability reasonably well. Students with low observed scores also receive low predicted scores, while students with high observed scores receive high predicted scores. This means that the estimated ability parameter `theta` is consistent with the actual number of correct answers.
+
+However, the graph also shows a small systematic pattern. For students with very low observed scores, many points are above the diagonal line. This means that the model slightly overpredicts their performance: it expects them to answer correctly a bit more often than they actually did. On the other hand, for students with very high observed scores, several points are below the diagonal line. This means that the model slightly underpredicts their performance: it expects a slightly lower proportion of correct answers than the one actually observed.
+
+This behaviour is quite common in Rasch models, because predictions are pulled toward the general structure of the model. The model does not simply reproduce the raw score, but estimates student ability by combining student performance with item difficulties. Therefore, extreme observed performances can be slightly smoothed: very weak students may be predicted a little higher, and very strong students may be predicted a little lower.
+
+In conclusion, the posterior predictive check suggests that the Rasch model fits the student scores reasonably well, because the points follow the diagonal line closely. At the same time, the small deviations at the extremes suggest that the model may slightly compress the differences between very low-performing and very high-performing students.
+
+```{r rasch-ppc-items, fig.width=10, fig.height=7}
+ggplot(ppc_items_1pl, aes(x = observed, y = expected_prediction, label = item)) +
+  geom_point(size = 2) +
+  geom_abline(intercept = 0, slope = 1, linetype = "dashed") +
+  geom_label_repel(
+    size = 3,
+    max.overlaps = Inf,
+    box.padding = 0.35,
+    point.padding = 0.25,
+    min.segment.length = 0,
+    segment.size = 0.3
+  ) +
+  labs(
+    title = "Posterior predictive check: item scores, Rasch model",
+    x = "Observed item proportion correct",
+    y = "Expected predicted item proportion correct"
+  ) +
+  coord_cartesian(clip = "off") +
+  theme(
+    plot.margin = margin(10, 30, 10, 10)
+  )
+```
+
+Each point represents one item. The x-axis shows the observed proportion of students who answered that item correctly, while the y-axis shows the average predicted probability of a correct answer for that item. The dashed diagonal line represents perfect agreement between observed and predicted item performance. If the points are close to the line, the Rasch model reproduces the observed item difficulty structure well.
+As you can see, basically the prediction on item difficulty is almost perfect
+
+```{r rasch-ppc-hist}
+df_ppc_students_1pl <- data.frame(
+  score = c(observed_student_score, replicated_student_score_1pl),
+  data_type = rep(c("Observed data", "Replicated data from Rasch"), each = N)
+)
+
+ggplot(df_ppc_students_1pl, aes(x = score, fill = data_type)) +
+  geom_histogram(alpha = 0.5, position = "identity", bins = 98) +
+  labs(
+    title = "Observed vs replicated student scores, Rasch model",
+    x = "Proportion correct",
+    y = "Number of students",
+    fill = "Data type"
+  ) +
+  theme(
+    legend.position = "bottom",
+    legend.title = element_text(size = 10),
+    legend.text = element_text(size = 9)
+  )
+```
+
+This histogram compares the distribution of the real observed student scores with the distribution of replicated scores simulated from the fitted Rasch model. The observed scores are the actual proportions of correct answers obtained by the students. The replicated scores are artificial scores generated by the model after estimating student abilities and item difficulties.
+
+The purpose of this posterior predictive check is to understand whether the Rasch model is able to generate data similar to the data we actually observed. If the two histograms overlap strongly, this means that the model reproduces the overall distribution of student performance well. If the two histograms were very different, this would suggest that the model misses some important structure in the data.
+
+In this graph, the observed and replicated distributions are quite similar. Most students are concentrated in the middle and middle-high range of performance, especially between about 0.50 and 0.75 proportion correct. The replicated data follows the same general shape as the observed data, so the Rasch model seems to capture the overall distribution of student scores reasonably well.
+
+There are still some small differences between the two histograms, but they do not appear very large. This means that the model is not perfect, but it is able to reproduce the main pattern of student performance. This check supports the idea that the Rasch model has an acceptable global fit.
+
+However, this graph only evaluates the overall distribution of student scores. It does not prove that the model fits every single item or every single student perfectly. For this reason, it should be interpreted as a general posterior predictive check, not as a complete proof that the model has no problems.
+
+# Rasch predictive indices
+
+```{r rasch-predictive-indices}
+p1_safe <- clip_probs(p_hat_1pl)
+
+log_loss_1pl <- -mean(
+  Y * log(p1_safe) + (1 - Y) * log(1 - p1_safe)
+)
+
+accuracy_1pl <- mean((p_hat_1pl > 0.5) == Y)
+
+student_rmse_1pl <- rmse(observed_student_score, expected_student_score_1pl)
+student_mae_1pl <- mae(observed_student_score, expected_student_score_1pl)
+
+student_correlation_1pl <- cor(
+  observed_student_score,
+  expected_student_score_1pl,
+  use = "complete.obs"
+)
+
+item_rmse_1pl <- rmse(observed_item_score, expected_item_score_1pl)
+item_mae_1pl <- mae(observed_item_score, expected_item_score_1pl)
+
+item_correlation_1pl <- cor(
+  observed_item_score,
+  expected_item_score_1pl,
+  use = "complete.obs"
+)
+
+indices_1pl <- data.frame(
+  model = "1PL / Rasch",
+  log_loss = log_loss_1pl,
+  accuracy = accuracy_1pl,
+  student_rmse = student_rmse_1pl,
+  student_mae = student_mae_1pl,
+  student_correlation = student_correlation_1pl,
+  item_rmse = item_rmse_1pl,
+  item_mae = item_mae_1pl,
+  item_correlation = item_correlation_1pl
+)
+
+cat("Predictive accuracy indices for the Rasch model:\n")
+cat("Lower log_loss, RMSE, and MAE are better. Higher accuracy, student_correlation, and item_correlation are better.\n")
+print(indices_1pl)
+```
+
+The predictive accuracy indices evaluate how well the Rasch model reproduces the observed response data. Let $y_{ij}$ be the observed response of student $i$ to item $j$, where $y_{ij}=1$ means a correct answer and $y_{ij}=0$ means an incorrect answer. Let $\hat{p}_{ij}$ be the probability of a correct answer predicted by the Rasch model.
+
+The **log-loss** measures the quality of the predicted probabilities:
+
+$$
+\text{Log-loss}
+=
+-\frac{1}{NJ}
+\sum_{i=1}^{N}
+\sum_{j=1}^{J}
+\left[
+y_{ij}\log(\hat{p}_{ij})
++
+(1-y_{ij})\log(1-\hat{p}_{ij})
+\right]
+$$
+
+Lower values of log-loss indicate better probabilistic prediction, because the model assigns higher probability to the responses that actually occurred.
+
+The **accuracy** measures the proportion of individual binary responses correctly classified by the model. A predicted response is classified as correct when $\hat{p}_{ij} \geq 0.5$:
+
+$$
+\hat{y}_{ij}
+=
+\begin{cases}
+1 & \text{if } \hat{p}_{ij} \geq 0.5 \\
+0 & \text{if } \hat{p}_{ij} < 0.5
+\end{cases}
+$$
+
+Then, accuracy is computed as:
+
+$$
+\text{Accuracy}
+=
+\frac{1}{NJ}
+\sum_{i=1}^{N}
+\sum_{j=1}^{J}
+\mathbb{I}(\hat{y}_{ij}=y_{ij})
+$$
+
+The **student-level RMSE** and **MAE** compare, for each student, the observed proportion of correct answers with the proportion predicted by the model. For student $i$, the observed score is:
+
+$$
+s_i = \frac{1}{J}\sum_{j=1}^{J} y_{ij}
+$$
+
+while the predicted score is:
+
+$$
+\hat{s}_i = \frac{1}{J}\sum_{j=1}^{J} \hat{p}_{ij}
+$$
+
+The student-level errors are then computed as:
+
+$$
+\text{RMSE}_{student}
+=
+\sqrt{
+\frac{1}{N}
+\sum_{i=1}^{N}
+(s_i-\hat{s}_i)^2
+}
+$$
+
+$$
+\text{MAE}_{student}
+=
+\frac{1}{N}
+\sum_{i=1}^{N}
+|s_i-\hat{s}_i|
+$$
+
+Lower values of RMSE and MAE mean that the predicted student scores are close to the observed student scores. The student-level correlation compares $s_i$ and $\hat{s}_i$. A high positive correlation means that students are ranked similarly by their observed performance and by the model predictions.
+
+The same logic is applied at the **item level**. For item $j$, the observed proportion of correct answers is:
+
+$$
+q_j = \frac{1}{N}\sum_{i=1}^{N} y_{ij}
+$$
+
+while the average predicted probability of a correct answer is:
+
+$$
+\hat{q}_j = \frac{1}{N}\sum_{i=1}^{N} \hat{p}_{ij}
+$$
+
+The item-level RMSE and MAE compare $q_j$ and $\hat{q}_j$ across items:
+
+$$
+\text{RMSE}_{item}
+=
+\sqrt{
+\frac{1}{J}
+\sum_{j=1}^{J}
+(q_j-\hat{q}_j)^2
+}
+$$
+
+$$
+\text{MAE}_{item}
+=
+\frac{1}{J}
+\sum_{j=1}^{J}
+|q_j-\hat{q}_j|
+$$
+
+The item-level correlation compares the observed and predicted item proportions. A value close to $1$ means that the Rasch model reproduces the ranking of item difficulty very well.
+
+Overall, low RMSE and MAE values, together with high student-level and item-level correlations, suggest that the Rasch model captures the main structure of the observed response data. In our case, these indices indicate good predictive accuracy.
+
+# Model 2: Bayesian 2PL model
+
+The 2PL model is an extension of the 1PL/Rasch model.
+
+In the 1PL model, each item has only one item parameter: the difficulty parameter \(b_j\). This means that items can be easier or more difficult, but all items are assumed to separate students in the same way.
+
+The 2PL model is more flexible because it adds a second item parameter: the discrimination parameter \(a_j\). The model is:
+
+$$
+\text{logit}(p_{ij}) = a_j(\theta_i - b_j)
+$$
+
+where
+
+$$
+\begin{aligned}
+\theta_i & = \text{student ability} \\ 
+b_j & = \text{item difficulty} \\ 
+a_j & = \text{item discrimination}
+\end{aligned}
+$$
+
+The difficulty parameter \(b_j\) tells us where the item is located on the ability scale. If \(b_j\) is high, the item is more difficult, because a student needs a higher ability level to have a good probability of answering correctly. If \(b_j\) is low, the item is easier.
+
+The discrimination parameter \(a_j\) tells us how well the item separates students with different ability levels. A high value of \(a_j\) means that the item is very informative: students below the item difficulty have a much lower probability of answering correctly, while students above the item difficulty have a much higher probability of answering correctly.
+
+In graphical terms, a high-discrimination item has a steeper item characteristic curve. This means that the probability of a correct answer increases very quickly around the difficulty point. A low-discrimination item has a flatter curve, meaning that weaker and stronger students have more similar probabilities of answering correctly.
+
+This is important because difficulty alone is not enough to judge the quality of an item. An item can be difficult, but not very useful if it does not clearly separate stronger and weaker students. The 2PL model allows us to identify not only which items are easy or difficult, but also which items are more informative for measuring student ability.
+
+In simple terms, the 1PL model asks: “How difficult is this item?”. The 2PL model asks two questions: “How difficult is this item?” and “How well does this item distinguish strong students from weak students?”.
+
+```{r model-2pl, eval=run_2pl}
+model_2pl <- "
+model {
+
+  for(i in 1:N) {
+
+    theta[i] ~ dnorm(0, 1)
+
+    for(j in 1:J) {
+
+      Y[i, j] ~ dbern(p[i, j])
+
+      logit(p[i, j]) <- a[j] * (theta[i] - b[j])
+
+      log_lik[i, j] <- Y[i, j] * log(p[i, j]) +
+                       (1 - Y[i, j]) * log(1 - p[i, j])
+
+      dev_contribution[i, j] <- -2 * log_lik[i, j]
+
+    }
+
+    student_deviance[i] <- sum(dev_contribution[i, 1:J])
+  }
+
+  for(j in 1:J) {
+
+    b[j] ~ dnorm(0, 1)
+
+    a[j] ~ dgamma(2, 2)
+
+  }
+
+  total_deviance <- sum(student_deviance[1:N])
+}
+"
+
+writeLines(model_2pl, "model_2pl.txt")
+```
+
+This code specifies the structure of the Bayesian 2PL model. For each student, the model estimates an ability parameter (\theta_i). For each item, it estimates both a difficulty parameter (b_j) and a discrimination parameter (a_j). The observed answer (Y_{ij}) follows a Bernoulli distribution, since the response is correct or incorrect. The logit of the probability of a correct answer is modeled as (a_j(\theta_i - b_j)), meaning that performance depends on the distance between ability and difficulty, weighted by item discrimination.
+
+# Run the 2PL model
+
+```{r inits-2pl, eval=run_2pl}
+if(!reuse_existing_results) {
+  inits_2pl <- vector("list", n_chains)
+  
+  for(chain in 1:n_chains) {
+    inits_2pl[[chain]] <- list(
+      theta = rnorm(N, 0, 0.2),
+      b = rnorm(J, 0, 0.2),
+      a = rgamma(J, shape = 2, rate = 2)
+    )
+  }
+}
+```
+
+Before running the MCMC algorithm, JAGS needs starting values for all unknown parameters. In this case, the code creates initial values for (\theta_i), (b_j), and (a_j). Student abilities and item difficulties are initialized close to zero, while discrimination parameters are initialized from a Gamma distribution, so they are positive. This is coherent with the model because discrimination should usually be positive: higher ability should increase the probability of a correct answer.
+
+```{r run-2pl, cache=TRUE, eval=run_2pl}
+if(reuse_existing_results) {
+
+  load(file.path(results_dir, "two_model_comparison_results.RData"), envir = .GlobalEnv)
+  cat("Reuse mode: 2PL posterior samples loaded from two_model_comparison_results.RData.\n")
+
+} else {
+
+  if(run_dic) {
+    load.module("dic")
+  }
+
+  jags_2pl <- jags.model(
+    file = "model_2pl.txt",
+    data = jags_data,
+    inits = inits_2pl,
+    n.chains = n_chains,
+    n.adapt = n_adapt
+  )
+
+  update(jags_2pl, burn_in)
+
+  samples_2pl <- coda.samples(
+    model = jags_2pl,
+    variable.names = c("theta", "b", "a"),
+    n.iter = n_iter,
+    thin = thin_value
+  )
+
+  if(run_dic) {
+    deviance_trace_2pl <- coda.samples(
+      model = jags_2pl,
+      variable.names = c("total_deviance"),
+      n.iter = n_iter,
+      thin = thin_value
+    )
+
+    dic_2pl <- dic.samples(
+      model = jags_2pl,
+      n.iter = n_iter,
+      thin = thin_value,
+      type = "pD"
+    )
+  }
+}
+```
+This section controls the estimation of the 2PL model. If reuse_existing_results is true, the code loads the previously saved results. If not, the model is run again in JAGS. First, JAGS compiles the model and performs adaptation, which helps tune the sampler. Then burn-in iterations are run and discarded, so that the chains can move away from their initial values. Finally, the code collects posterior samples for (\theta), (b), and (a), which represent the Bayesian estimates of student ability, item difficulty, and item discrimination.
+
+# 2PL MCMC diagnostics
+
+```{r diagnostics-2pl, eval=run_2pl}
+cat("Posterior summary of the 2PL model parameters:\n")
+cat("This table reports posterior means, standard deviations, and credible intervals for theta, b, and a.\n")
+cat("theta parameters represent student abilities.\n")
+cat("b parameters represent item difficulties.\n")
+cat("a parameters represent item discriminations.\n\n")
+print(summary(samples_2pl))
+
+diagnostic_params_2pl <- c(
+  "b[1]", "b[2]", "b[3]", "b[4]", "b[5]", "b[6]",
+  "a[1]", "a[2]", "a[3]", "a[4]", "a[5]", "a[6]",
+  "theta[1]", "theta[2]", "theta[3]", "theta[4]", "theta[5]", "theta[6]"
+)
+
+cat("\nSelected parameters used for convergence diagnostics:\n")
+cat("We do not inspect all theta, b and a parameters in detail because there are many of them.\n")
+cat("Instead, we inspect a small set of item difficulties, item discriminations and student abilities.\n\n")
+print(diagnostic_params_2pl)
+
+gelman_2pl <- gelman.diag(samples_2pl[, diagnostic_params_2pl])
+ess_2pl <- effectiveSize(samples_2pl[, diagnostic_params_2pl])
+
+cat("\nGelman-Rubin convergence diagnostic for selected 2PL parameters:\n")
+cat("The Gelman-Rubin diagnostic compares the MCMC chains.\n")
+cat("Values close to 1 indicate that the chains have converged to the same posterior distribution.\n")
+cat("As a practical rule, values below 1.05 are very good, and values below 1.10 are usually acceptable.\n\n")
+print(gelman_2pl)
+
+max_gelman_upper <- max(gelman_2pl$psrf[, "Upper C.I."], na.rm = TRUE)
+
+cat("\nInterpretation of the Gelman-Rubin diagnostic for selected parameters:\n")
+
+if(max_gelman_upper < 1.05) {
+  cat("The largest upper confidence interval among selected parameters is", round(max_gelman_upper, 3), ".\n")
+  cat("This is very close to 1, so the selected 2PL parameters show very good convergence.\n")
+} else if(max_gelman_upper < 1.10) {
+  cat("The largest upper confidence interval among selected parameters is", round(max_gelman_upper, 3), ".\n")
+  cat("This is acceptable, although convergence should still be checked with traceplots.\n")
+} else {
+  cat("The largest upper confidence interval among selected parameters is", round(max_gelman_upper, 3), ".\n")
+  cat("This may indicate convergence problems. More iterations or better starting values may be needed.\n")
+}
+
+cat("\nEffective sample size for selected 2PL parameters:\n")
+cat("The effective sample size measures how much independent information is contained in the MCMC draws.\n")
+cat("Because MCMC draws are autocorrelated, the effective sample size is usually lower than the total number of saved draws.\n")
+cat("Higher values are better.\n\n")
+print(round(ess_2pl, 2))
+
+saved_draws_per_chain <- niter(samples_2pl)
+number_of_chains <- nchain(samples_2pl)
+total_saved_draws <- saved_draws_per_chain * number_of_chains
+
+cat("\nNumber of saved posterior draws:\n")
+cat("Saved draws per chain:", saved_draws_per_chain, "\n")
+cat("Number of chains:", number_of_chains, "\n")
+cat("Total saved draws:", total_saved_draws, "\n")
+
+cat("\nInterpretation of the effective sample size for selected parameters:\n")
+cat("The maximum possible effective sample size is approximately equal to the total number of saved draws.\n")
+cat("Here, the total number of saved draws is", total_saved_draws, ".\n")
+cat("If an effective sample size is close to this value, the MCMC draws contain almost as much information as independent draws.\n")
+cat("If an effective sample size is much lower, the chain has more autocorrelation for that parameter.\n\n")
+
+min_ess <- min(ess_2pl, na.rm = TRUE)
+max_ess <- max(ess_2pl, na.rm = TRUE)
+
+cat("Minimum effective sample size among selected parameters:", round(min_ess, 2), "\n")
+cat("Maximum effective sample size among selected parameters:", round(max_ess, 2), "\n")
+
+if(min_ess > 400) {
+  cat("All selected parameters have a good effective sample size for this run.\n")
+} else if(min_ess > 200) {
+  cat("The effective sample sizes are acceptable.\n")
+} else {
+  cat("Some effective sample sizes are low. More MCMC iterations may be useful.\n")
+}
+
+# General diagnostics for all 2PL parameters
+
+all_params_2pl <- varnames(samples_2pl)
+
+all_params_2pl <- all_params_2pl[
+  grepl("^b\\[", all_params_2pl) |
+  grepl("^a\\[", all_params_2pl) |
+  grepl("^theta\\[", all_params_2pl)
+]
+
+cat("\nGeneral diagnostics for all 2PL parameters:\n")
+cat("The following diagnostics are computed using all monitored item difficulties, item discriminations and student abilities.\n")
+cat("This gives a broader picture than the selected subset used above.\n\n")
+
+gelman_all_2pl <- gelman.diag(
+  samples_2pl[, all_params_2pl],
+  multivariate = FALSE
+)
+
+gelman_all_psrf <- gelman_all_2pl$psrf
+
+upper_ci_all <- gelman_all_psrf[, "Upper C.I."]
+upper_ci_all <- upper_ci_all[!is.na(upper_ci_all)]
+
+max_gelman_upper_all <- max(upper_ci_all)
+max_gelman_upper_all_param <- names(upper_ci_all)[which.max(upper_ci_all)]
+
+cat("Highest Gelman-Rubin upper confidence interval among all 2PL parameters:\n")
+cat(max_gelman_upper_all_param, "=", round(max_gelman_upper_all, 3), "\n")
+
+if(max_gelman_upper_all < 1.05) {
+  cat("Overall, the 2PL model shows very good convergence across all monitored parameters.\n")
+} else if(max_gelman_upper_all < 1.10) {
+  cat("Overall, convergence is acceptable, although some parameters should still be checked carefully.\n")
+} else {
+  cat("At least one parameter may have convergence problems. More iterations or better starting values may be useful.\n")
+}
+
+ess_all_2pl <- effectiveSize(samples_2pl[, all_params_2pl])
+
+ess_all_2pl <- ess_all_2pl[!is.na(ess_all_2pl)]
+
+min_ess_all <- min(ess_all_2pl)
+max_ess_all <- max(ess_all_2pl)
+
+min_ess_all_param <- names(ess_all_2pl)[which.min(ess_all_2pl)]
+max_ess_all_param <- names(ess_all_2pl)[which.max(ess_all_2pl)]
+
+cat("\nEffective sample size among all 2PL parameters:\n")
+cat("Lowest effective sample size:", min_ess_all_param, "=", round(min_ess_all, 2), "\n")
+cat("Highest effective sample size:", max_ess_all_param, "=", round(max_ess_all, 2), "\n")
+
+if(min_ess_all > 400) {
+  cat("All 2PL parameters have a good effective sample size for this run.\n")
+} else if(min_ess_all > 200) {
+  cat("The effective sample sizes are generally acceptable, although some parameters are less efficiently sampled.\n")
+} else {
+  cat("Some 2PL parameters have low effective sample size. More MCMC iterations may be useful.\n")
+}
+```
+
+In this model, theta represents student ability, b represents item difficulty, and a represents item discrimination. Higher values of theta indicate stronger students, higher values of b indicate more difficult items, and higher values of a indicate items that better discriminate between students with different ability levels.
+
+The Gelman-Rubin diagnostic is used to assess the convergence of the MCMC chains. The basic idea is to compare the variability **within each chain** with the variability **between different chains**. If the chains have converged to the same posterior distribution, these two sources of variability should be similar. For this reason, values of the Potential Scale Reduction Factor, or **PSRF**, close to **1** indicate good convergence.
+
+In this output, the PSRF values for the selected 2PL parameters are all very close to 1, suggesting that the chains mixed well and reached a stable posterior distribution. The upper confidence limits are also close to 1, which reinforces the evidence of convergence.
+
+The multivariate PSRF extends this idea by checking convergence for the selected parameters **jointly**, rather than one parameter at a time. Since the multivariate PSRF is also equal to 1, this provides additional evidence that the MCMC algorithm performed well for the selected parameters. Overall, these diagnostics suggest that there are no clear convergence problems in this part of the 2PL model.
+
+
+```{r trace-2pl-b, eval=run_2pl}
+# These traceplots show the MCMC chains for the first six item difficulty parameters.
+# In the 2PL model, b[j] represents the difficulty of item j.
+# A good traceplot should fluctuate around a stable region with no long trend.
+
+traceplot(samples_2pl[, c("b[1]", "b[2]", "b[3]", "b[4]", "b[5]", "b[6]")])
+```
+
+The traceplots above show the MCMC chains for the first six 2PL item difficulty parameters. They are not all the item difficulties, but a representative subset used for visual convergence checking. If the chains overlap and move around the same stable region, this suggests that the posterior samples for these difficulty parameters are reliable. If the chains are separated or show a trend, the MCMC run may need more iterations.
+
+```{r trace-2pl-a, eval=run_2pl}
+# These traceplots show the MCMC chains for the first six item discrimination parameters.
+# In the 2PL model, a[j] measures how strongly item j separates weak and strong students.
+# Stable and well-mixed chains suggest reliable posterior estimates of discrimination.
+
+traceplot(samples_2pl[, c("a[1]", "a[2]", "a[3]", "a[4]", "a[5]", "a[6]")])
+```
+
+The traceplots above show the MCMC chains for the first six item discrimination parameters. This is especially important in the 2PL model because discrimination is the new parameter added compared with the Rasch model. If these chains mix well, it suggests that the model is able to estimate how informative the selected items are. Only six discrimination parameters are shown because plotting all item parameters would make the diagnostic section too long.
+
+```{r trace-2pl-theta, eval=run_2pl}
+# These traceplots show the MCMC chains for the first six student ability parameters.
+# In the 2PL model, theta[i] represents the latent ability of student i.
+# Since there is one theta for each sampled student, we only inspect a small subset.
+
+traceplot(samples_2pl[, c("theta[1]", "theta[2]", "theta[3]", "theta[4]", "theta[5]", "theta[6]")])
+```
+
+The traceplots above show the MCMC chains for the first six student ability parameters in the 2PL model. Since the model estimates one `theta` for every sampled student, it is not practical to show all traceplots. The purpose is to check whether a representative subset of ability parameters behaves well. Stable traceplots support the reliability of the posterior ability estimates used in the following graphs.
+
+# 2PL posterior estimates
+
+```{r extract-2pl, eval=run_2pl}
+matrix_2pl <- as.matrix(samples_2pl)
+
+theta2_cols <- sort_jags_cols(grep("^theta\\[", colnames(matrix_2pl), value = TRUE))
+b2_cols <- sort_jags_cols(grep("^b\\[", colnames(matrix_2pl), value = TRUE))
+a2_cols <- sort_jags_cols(grep("^a\\[", colnames(matrix_2pl), value = TRUE))
+
+theta_hat_2pl <- as.numeric(colMeans(matrix_2pl[, theta2_cols, drop = FALSE]))
+b_hat_2pl <- as.numeric(colMeans(matrix_2pl[, b2_cols, drop = FALSE]))
+a_hat_2pl <- as.numeric(colMeans(matrix_2pl[, a2_cols, drop = FALSE]))
+
+student_score_2pl <- rowMeans(Y)
+item_score_2pl <- colMeans(Y)
+
+stopifnot(length(theta_hat_2pl) == nrow(Y))
+stopifnot(length(student_score_2pl) == nrow(Y))
+stopifnot(length(wle) == nrow(Y))
+
+stopifnot(length(b_hat_2pl) == ncol(Y))
+stopifnot(length(a_hat_2pl) == ncol(Y))
+stopifnot(length(item_score_2pl) == ncol(Y))
+
+results_students_2pl <- data.frame(
+  student_id = sample_id,
+  theta_hat_2pl = theta_hat_2pl,
+  raw_score = student_score_2pl,
+  WLE_ITA_200 = wle
+)
+
+results_items_2pl <- data.frame(
+  item = colnames(Y),
+  b_hat_2pl = b_hat_2pl,
+  a_hat_2pl = a_hat_2pl,
+  proportion_correct = item_score_2pl
+)
+
+cat("First rows of the student-level 2PL results:\n")
+cat("Each row is one sampled student, with estimated ability, raw score, and WLE score.\n")
+print(head(results_students_2pl))
+
+cat("\nFirst rows of the item-level 2PL results:\n")
+cat("Each row is one item, with estimated difficulty, estimated discrimination, and observed proportion correct.\n")
+print(head(results_items_2pl))
+```
+
+# Interpret 2PL item difficulty
+
+In the 2PL model, item difficulty has the same basic meaning as in the Rasch model: higher `b_hat_2pl` values indicate more difficult items, while lower values indicate easier items. However, the 2PL model also estimates discrimination, so difficulty is interpreted together with how informative each item is.
+
+```{r interpret-2pl-difficulty, eval=run_2pl}
+# We add ranking columns and percentage columns to compare item difficulty
+# in a model-based way and in a raw-data way.
+# For b_hat_2pl, lower values mean easier items.
+# For proportion_correct, higher values mean easier items.
+# observed_difficulty_percent is the percentage of students who answered incorrectly.
+
+results_items_2pl <- results_items_2pl %>%
+  mutate(
+    observed_easiness_percent = proportion_correct * 100,
+    observed_difficulty_percent = (1 - proportion_correct) * 100,
+    rank_b_hat_easy_to_hard = rank(b_hat_2pl, ties.method = "first"),
+    rank_prop_easy_to_hard = rank(-proportion_correct, ties.method = "first"),
+    rank_difference = rank_b_hat_easy_to_hard - rank_prop_easy_to_hard,
+    abs_rank_difference = abs(rank_difference)
+  )
+
+results_items_2pl_difficulty <- results_items_2pl %>%
+  arrange(rank_b_hat_easy_to_hard)
+
+cor_b2_itemscore <- cor(
+  results_items_2pl$b_hat_2pl,
+  results_items_2pl$proportion_correct
+)
+
+cor_rank_b2_prop <- cor(
+  results_items_2pl$rank_b_hat_easy_to_hard,
+  results_items_2pl$rank_prop_easy_to_hard,
+  method = "spearman"
+)
+
+cat("Correlation between 2PL difficulty and observed item proportion correct:\n")
+cat("This value should usually be negative: difficult items should have lower proportions correct.\n")
+print(cor_b2_itemscore)
+
+cat("\nSpearman correlation between the two item difficulty rankings:\n")
+cat("This value should usually be positive and high if the two rankings are similar.\n")
+print(cor_rank_b2_prop)
+
+cat("\nItem-level 2PL results ordered from easiest to hardest according to b_hat_2pl:\n")
+print(
+  results_items_2pl_difficulty %>%
+    select(
+      item,
+      b_hat_2pl,
+      a_hat_2pl,
+      proportion_correct,
+      observed_easiness_percent,
+      observed_difficulty_percent,
+      rank_b_hat_easy_to_hard,
+      rank_prop_easy_to_hard,
+      rank_difference,
+      abs_rank_difference
+    )
+)
+
+
+rank_diagnostics_2pl <- results_items_2pl %>%
+  summarise(
+    number_of_items = n(),
+    mean_abs_rank_difference = mean(abs_rank_difference),
+    median_abs_rank_difference = median(abs_rank_difference),
+    max_abs_rank_difference = max(abs_rank_difference),
+    items_with_same_rank = sum(abs_rank_difference == 0),
+    items_with_difference_1_or_less = sum(abs_rank_difference <= 1),
+    items_with_difference_3_or_less = sum(abs_rank_difference <= 3),
+    items_with_difference_5_or_less = sum(abs_rank_difference <= 5)
+  )
+
+print(rank_diagnostics_2pl)
+
+cat("\nItems with the largest ranking differences:\n")
+print(
+  results_items_2pl %>%
+    arrange(desc(abs_rank_difference)) %>%
+    select(
+      item,
+      b_hat_2pl,
+      a_hat_2pl,
+      proportion_correct,
+      rank_b_hat_easy_to_hard,
+      rank_prop_easy_to_hard,
+      rank_difference,
+      abs_rank_difference
+    ) %>%
+    head(10)
+)
+```
+
+The table compares the 2PL model-based difficulty ranking with the raw observed difficulty ranking. The column `rank_b_hat_easy_to_hard` orders items using the posterior mean 2PL difficulty, while `rank_prop_easy_to_hard` orders items using the observed proportion correct. The percentage columns make the table easier to read: `observed_easiness_percent` is the percentage of correct answers, while `observed_difficulty_percent` is the percentage of wrong answers.
+
+About the Spearman correlation, it compares the ranking of items obtained from the 2PL model with the ranking obtained from the observed proportion of correct answers. Unlike a standard correlation, it does not compare the exact numerical values, but only the order of the items. In this case, the value is very high and positive, meaning that the two rankings are very similar. Therefore, the items estimated as easier by the 2PL model are generally also the items with a higher observed proportion of correct answers, while the items estimated as harder are generally those with a lower observed proportion of correct answers.
+
+```{r plot-2pl-difficulty, eval=run_2pl}
+eps_2pl <- 1e-6
+
+plot_items_2pl_difficulty <- results_items_2pl_difficulty %>%
+  mutate(
+    proportion_correct_safe_2pl = pmin(pmax(proportion_correct, eps_2pl), 1 - eps_2pl),
+    observed_difficulty_from_prop_2pl = -qlogis(proportion_correct_safe_2pl),
+    difficulty_difference_2pl = b_hat_2pl - observed_difficulty_from_prop_2pl
+  ) %>%
+  arrange(b_hat_2pl) %>%
+  mutate(item_ordered = factor(item, levels = item))
+
+plot_items_2pl_difficulty_long <- plot_items_2pl_difficulty %>%
+  select(item_ordered, b_hat_2pl, observed_difficulty_from_prop_2pl) %>%
+  pivot_longer(
+    cols = c(b_hat_2pl, observed_difficulty_from_prop_2pl),
+    names_to = "measure",
+    values_to = "difficulty_value"
+  ) %>%
+  mutate(
+    measure = recode(
+      measure,
+      b_hat_2pl = "Bayesian 2PL difficulty",
+      observed_difficulty_from_prop_2pl = "Observed difficulty from proportion correct"
+    )
+  )
+
+difference_labels_2pl <- plot_items_2pl_difficulty %>%
+  mutate(
+    measure = "Bayesian 2PL difficulty",
+    difference_label = round(difficulty_difference_2pl, 2)
+  )
+
+ggplot(plot_items_2pl_difficulty_long, aes(x = item_ordered, y = difficulty_value, fill = measure)) +
+  geom_col(position = position_dodge(width = 0.8), width = 0.7) +
+  geom_text(
+    data = difference_labels_2pl,
+    aes(
+      x = item_ordered,
+      y = b_hat_2pl,
+      label = difference_label,
+      group = measure
+    ),
+    position = position_dodge(width = 0.8),
+    hjust = ifelse(difference_labels_2pl$b_hat_2pl >= 0, -0.1, 1.1),
+    size = 2.8,
+    inherit.aes = FALSE
+  ) +
+  coord_flip() +
+  scale_y_continuous(expand = expansion(mult = c(0.15, 0.25))) +
+  labs(
+    title = "Bayesian 2PL difficulty compared with observed item difficulty",
+    subtitle = "Text labels show the numerical difference: Bayesian 2PL difficulty minus observed difficulty",
+    x = "Item",
+    y = "Difficulty value",
+    fill = "Measure"
+  ) +
+  theme(
+    legend.position = "bottom"
+  )
+```
+**Interpretation of the 2PL difficulty graph.**
+This graph compares the posterior mean difficulty estimated by the Bayesian 2PL model with an observed difficulty index derived from the proportion of correct answers. The observed proportion was transformed using `-logit(proportion_correct)`, so both measures have the same interpretation: lower values indicate easier items, while higher values indicate more difficult items.
+
+As already seen in the Rasch/1PL difficulty graph, the model-based difficulty estimates are broadly consistent with the observed difficulty: items answered correctly by many students usually receive lower difficulty values, while items answered correctly by fewer students usually receive higher difficulty values. However, in the 2PL graph the differences between the Bayesian difficulty and the observed difficulty are larger than in the 1PL graph. This is normal, because the Rasch model estimates only item difficulty and assumes the same discrimination for all items, while the 2PL model estimates both item difficulty and item discrimination.
+
+For this reason, the 2PL difficulty is not based only on how many students answered each item correctly, but also on which students answered correctly. If an item separates high-ability and low-ability students differently from the others, the 2PL model can adjust its difficulty estimate, producing a larger difference from the simple observed difficulty based on the proportion correct.
+
+Therefore, these differences should not automatically be interpreted as errors. They show that the 2PL model is using more information than the raw percentage of correct answers. In particular, the 2PL model can move some item difficulties farther from the observed difficulty because it also considers the discrimination power of each item.
+
+
+```{r plot-2pl-item-difficulty-scatter, eval=run_2pl, fig.width=10, fig.height=7}
+ggplot(results_items_2pl, aes(x = proportion_correct, y = b_hat_2pl, label = item)) +
+  geom_point(size = 2) +
+  geom_smooth(method = "lm", se = FALSE) +
+  ggrepel::geom_label_repel(
+    size = 3,
+    max.overlaps = Inf,
+    box.padding = 0.35,
+    point.padding = 0.25,
+    min.segment.length = 0,
+    segment.size = 0.3
+  ) +
+  labs(
+    title = "Observed item performance vs 2PL difficulty",
+    x = "Observed proportion correct",
+    y = "Posterior mean difficulty from 2PL"
+  ) +
+  theme(
+    plot.margin = margin(10, 20, 10, 10)
+  )
+```
+
+**Interpretation of the observed item performance vs 2PL difficulty graph.**  
+This scatter plot compares the observed proportion correct with the posterior mean difficulty estimated by the 2PL model. As in the Rasch model, a negative relationship is expected: items answered correctly by many students should usually have lower estimated difficulty, while items answered correctly by fewer students should usually have higher estimated difficulty.
+
+In the 2PL model, however, this relationship can be slightly less mechanical than in the Rasch model because difficulty is estimated together with item discrimination. This means that the model does not only consider how many students answered each item correctly, but also how strongly each item separates students with different ability levels. For this reason, the graph is useful as a visual check that the 2PL difficulty estimates remain coherent with the raw item performance, while still allowing some adjustment due to discrimination.
+
+Anyways, the points follow a clear decreasing pattern, meaning the model-based difficulty estimates are coherent with the raw item performance. Items that deviate more from the general pattern are not necessarily wrong estimates; they may be items where the response pattern contains additional information that is captured by the 2PL model through the discrimination parameter.
+
+# Interpret 2PL item discrimination
+
+```{r interpret-2pl-discrimination, eval=run_2pl}
+# We add ranking columns to analyse item discrimination.
+# For a_hat_2pl, higher values mean more discriminating items.
+# For proportion_correct, higher values mean easier items.
+# Important: proportion_correct measures item easiness, not discrimination.
+# Therefore, the correlation between a_hat_2pl and proportion_correct is only descriptive.
+
+results_items_2pl <- results_items_2pl %>%
+  mutate(
+    observed_easiness_percent = proportion_correct * 100,
+    observed_difficulty_percent = (1 - proportion_correct) * 100,
+    rank_a_hat_most_to_least_discriminating = rank(-a_hat_2pl, ties.method = "first"),
+    rank_prop_easy_to_hard = rank(-proportion_correct, ties.method = "first"),
+    rank_difference_discrimination_vs_easiness =
+      rank_a_hat_most_to_least_discriminating - rank_prop_easy_to_hard,
+    abs_rank_difference_discrimination_vs_easiness =
+      abs(rank_difference_discrimination_vs_easiness)
+  )
+
+results_items_2pl_discrimination <- results_items_2pl %>%
+  arrange(rank_a_hat_most_to_least_discriminating)
+
+cor_a2_itemscore <- cor(
+  results_items_2pl$a_hat_2pl,
+  results_items_2pl$proportion_correct
+)
+
+cor_rank_a2_prop <- cor(
+  results_items_2pl$rank_a_hat_most_to_least_discriminating,
+  results_items_2pl$rank_prop_easy_to_hard,
+  method = "spearman"
+)
+
+cat("Correlation between 2PL discrimination and observed item proportion correct:\n")
+cat("This value is only descriptive, because proportion correct measures easiness, not discrimination.\n")
+print(cor_a2_itemscore)
+
+
+
+cat("\nItem-level 2PL results ordered from most to least discriminating according to a_hat_2pl:\n")
+print(
+  results_items_2pl_discrimination %>%
+    select(
+      item,
+      a_hat_2pl,
+      b_hat_2pl,
+      proportion_correct,
+      observed_easiness_percent,
+      observed_difficulty_percent,
+      rank_a_hat_most_to_least_discriminating,
+      rank_prop_easy_to_hard,
+      rank_difference_discrimination_vs_easiness,
+      abs_rank_difference_discrimination_vs_easiness
+    )
+)
+
+rank_diagnostics_2pl_discrimination <- results_items_2pl %>%
+  summarise(
+    number_of_items = n(),
+    mean_abs_rank_difference = mean(abs_rank_difference_discrimination_vs_easiness),
+    median_abs_rank_difference = median(abs_rank_difference_discrimination_vs_easiness),
+    max_abs_rank_difference = max(abs_rank_difference_discrimination_vs_easiness),
+    items_with_same_rank = sum(abs_rank_difference_discrimination_vs_easiness == 0),
+    items_with_difference_1_or_less = sum(abs_rank_difference_discrimination_vs_easiness <= 1),
+    items_with_difference_3_or_less = sum(abs_rank_difference_discrimination_vs_easiness <= 3),
+    items_with_difference_5_or_less = sum(abs_rank_difference_discrimination_vs_easiness <= 5)
+  )
+
+cat("\nSpearman correlation between the discrimination ranking and the observed easiness ranking:\n")
+cat("This value may be lower than the difficulty ranking correlation, because discrimination and easiness are different item properties.\n")
+print(cor_rank_a2_prop)
+
+cat("\nRanking diagnostics for discrimination versus observed easiness:\n")
+print(rank_diagnostics_2pl_discrimination)
+
+cat("\nItems with the largest ranking differences between discrimination and observed easiness:\n")
+print(
+  results_items_2pl %>%
+    arrange(desc(abs_rank_difference_discrimination_vs_easiness)) %>%
+    select(
+      item,
+      a_hat_2pl,
+      b_hat_2pl,
+      proportion_correct,
+      rank_a_hat_most_to_least_discriminating,
+      rank_prop_easy_to_hard,
+      rank_difference_discrimination_vs_easiness,
+      abs_rank_difference_discrimination_vs_easiness
+    ) %>%
+    head(10)
+)
+
+cat("\nTen most discriminating items according to the 2PL model:\n")
+print(head(results_items_2pl_discrimination, 10))
+
+cat("\nTen least discriminating items according to the 2PL model:\n")
+print(tail(results_items_2pl_discrimination, 10))
+```
+The table compares the 2PL model-based discrimination ranking with the raw observed easiness ranking. The column `rank_a_hat_most_to_least_discriminating` orders items using the posterior mean 2PL discrimination parameter, while `rank_prop_easy_to_hard` orders items using the observed proportion correct. However, these two rankings measure different aspects of the items. The 2PL discrimination parameter `a_hat_2pl` measures how well an item separates stronger and weaker students, while the observed proportion correct mainly measures how easy or difficult the item was.
+
+About the Spearman correlation, it compares the order of the items according to discrimination with the order of the items according to observed easiness. In this case, the value is about 0.23, which indicates only a weak positive relationship between the two rankings. This result is reasonable, because an item can be very discriminating without necessarily being among the easiest or hardest items. Therefore, unlike the difficulty analysis, we should not expect a very strong correlation between `a_hat_2pl` and the observed proportion correct. The low Spearman value suggests that item discrimination provides additional information that is not captured by the simple percentage of correct answers.
+
+
+```{r plot-2pl-discrimination, eval=run_2pl}
+plot_items_2pl_discrimination <- results_items_2pl_discrimination %>%
+  mutate(
+    discrimination_label = round(a_hat_2pl, 2)
+  )
+
+ggplot(plot_items_2pl_discrimination, aes(x = reorder(item, a_hat_2pl), y = a_hat_2pl)) +
+  geom_col() +
+  geom_text(
+    aes(label = discrimination_label),
+    hjust = -0.1,
+    size = 3
+  ) +
+  coord_flip() +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.20))) +
+  labs(
+    title = "Estimated item discrimination from Bayesian 2PL model",
+    subtitle = "Text labels show the posterior mean discrimination for each item",
+    x = "Item",
+    y = "Posterior mean discrimination",
+    caption = "Items at the top are the most informative; items at the bottom discriminate less between students."
+  )
+```
+
+**Interpretation of the discrimination graph.**  
+This graph shows the estimated **item discrimination parameter** from the Bayesian 2PL model. In the 2PL model, discrimination measures how strongly an item distinguishes between students with different ability levels. The numerical labels show the posterior mean discrimination for each item. Items with a high discrimination value are more informative because the probability of a correct answer changes more sharply as ability increases. Items with a low discrimination value are less useful for separating students, because their probability curve is flatter. Therefore, the items at the top of the graph are the most discriminating and are expected to have higher information peaks in the item information curves.
+
+This graph is one of the most important additions of the 2PL model compared with the Rasch model. In the Rasch model, all items are assumed to have the same discrimination, so all items are assumed to separate students equally well. In the 2PL model, instead, each item receives its own discrimination parameter.
+
+Items with high discrimination are especially useful because they create a sharper distinction between students with lower and higher ability. This means that a small increase in ability produces a large increase in the probability of answering correctly. Items with low discrimination are less informative because weak and strong students have more similar probabilities of answering correctly. For this reason, low-discrimination items may be less useful for measuring ability, even if they are easy or difficult.
+
+# 2PL item characteristic curves
+
+Item characteristic curves are especially useful for the 2PL model because they show both difficulty and discrimination at the same time. A curve shifted to the right indicates a more difficult item, while a steeper curve indicates a more discriminating item.
+
+```{r plot-2pl-icc-selected-items-big, eval=run_2pl, fig.width=9, fig.height=6, out.width="100%", fig.show="asis", message=FALSE, warning=FALSE}
+# Select representative 2PL items.
+# The same item can appear more than once if it has more than one role.
+
+average_b_2pl <- mean(results_items_2pl$b_hat_2pl, na.rm = TRUE)
+
+selected_items_2pl <- bind_rows(
+  results_items_2pl %>%
+    slice_min(b_hat_2pl, n = 1, with_ties = FALSE) %>%
+    mutate(type = "Easiest item"),
+  results_items_2pl %>%
+    slice_max(b_hat_2pl, n = 1, with_ties = FALSE) %>%
+    mutate(type = "Hardest item"),
+  results_items_2pl %>%
+    slice_min(abs(b_hat_2pl - average_b_2pl), n = 1, with_ties = FALSE) %>%
+    mutate(type = "Average difficulty item"),
+  results_items_2pl %>%
+    slice_max(a_hat_2pl, n = 1, with_ties = FALSE) %>%
+    mutate(type = "Most discriminating item"),
+  results_items_2pl %>%
+    slice_min(a_hat_2pl, n = 1, with_ties = FALSE) %>%
+    mutate(type = "Least discriminating item")
+) %>%
+  mutate(
+    type = factor(
+      type,
+      levels = c(
+        "Most discriminating item",
+        "Easiest item",
+        "Average difficulty item",
+        "Hardest item",
+        "Least discriminating item"
+      )
+    ),
+    item_label = paste0(item, " - ", type),
+    difficulty_label = paste0("b = ", round(b_hat_2pl, 2))
+  ) %>%
+  arrange(type)
+
+theta_grid_2pl <- seq(-4, 4, length.out = 200)
+
+icc_data_2pl <- selected_items_2pl %>%
+  tidyr::crossing(theta = theta_grid_2pl) %>%
+  mutate(
+    probability_correct = plogis(a_hat_2pl * (theta - b_hat_2pl))
+  )
+
+for (lab in selected_items_2pl$item_label) {
+  
+  plot_data <- icc_data_2pl %>%
+    filter(item_label == lab)
+  
+  item_info <- selected_items_2pl %>%
+    filter(item_label == lab) %>%
+    slice(1)
+  
+  p <- ggplot(plot_data, aes(x = theta, y = probability_correct)) +
+    geom_line(linewidth = 1) +
+    geom_hline(yintercept = 0.5, linetype = "dashed") +
+    geom_vline(
+      xintercept = item_info$b_hat_2pl,
+      linetype = "dashed"
+    ) +
+    geom_point(
+      data = item_info,
+      aes(x = b_hat_2pl, y = 0.5),
+      inherit.aes = FALSE,
+      size = 2
+    ) +
+    geom_text(
+      data = item_info,
+      aes(x = b_hat_2pl, y = 0.55, label = difficulty_label),
+      inherit.aes = FALSE,
+      angle = 90,
+      vjust = -0.5,
+      size = 3
+    ) +
+    labs(
+      title = lab,
+      subtitle = "2PL item characteristic curve: dashed lines show the difficulty point where P(correct) = 0.50",
+      x = "Student ability",
+      y = "Probability of correct answer"
+    ) +
+    coord_cartesian(ylim = c(0, 1))
+  
+  print(p)
+}
+```
+
+
+
+**Interpretation of the 2PL item characteristic curves.**  
+These curves show how the probability of answering an item correctly changes as student ability increases. In the 2PL model, each item has its own **difficulty** parameter and its own **discrimination** parameter. The difficulty determines where the curve is located on the ability scale, while the discrimination determines how steep the curve is.
+
+In the graph, **A2** is the most discriminating item. Its curve is very steep: the probability of a correct answer changes very quickly when student ability moves around the central part of the curve. This means that A2 is especially useful for separating students with different ability levels. Students below a certain ability level have a very low probability of answering correctly, while students just above that level have a much higher probability. Therefore, small differences in ability lead to large differences in the predicted probability of success.
+
+**A3** is the easiest item. Its curve is shifted to the left, meaning that even students with relatively low ability already have a fairly good probability of answering correctly. The probability increases quickly and then becomes very close to 1 for medium and high ability students. This means that A3 is useful for identifying very low-ability students, but it becomes less informative among medium and high-ability students because almost all of them are predicted to answer correctly.
+
+**B10** is the hardest and less  discriminating item. Its curve is shifted to the right and remains much lower than the others across most of the ability range. Even students with high ability do not reach a probability close to 1. This means that B10 is a difficult item, because students need a much higher ability level to have a strong probability of answering correctly. Moreover the probability of a correct answer increases only slowly as student ability increases. In practical terms, this item does not separate students very clearly, because low, medium, and high-ability students have probabilities that are not extremely different from each other.
+
+Compared with the Rasch model, the 2PL model is more flexible because the item curves are not forced to have the same steepness. In the Rasch model, items differ only in difficulty, so the curves are shifted left or right but have the same general shape. In the 2PL model, instead, items can differ both in difficulty and discrimination. This is why A2 has a very steep curve, A3 is easier and shifted to the left, while B10 is difficult and much flatter.
+
+
+# 2PL item information curves
+
+Item information curves show which items are most useful for estimating ability at different points of the ability scale. This is one of the clearest advantages of the 2PL model, because items with higher discrimination can provide more information.
+
+```{r plot-2pl-information-selected-items-big, eval=run_2pl, fig.width=9, fig.height=6, out.width="100%", fig.show="asis", message=FALSE, warning=FALSE}
+# Item information shows how useful an item is at different ability levels.
+# In the 2PL model, highly discriminating items usually provide more information.
+# The peak is around the item difficulty, while the height depends on discrimination.
+
+information_data_2pl <- selected_items_2pl %>%
+  tidyr::crossing(theta = theta_grid_2pl) %>%
+  mutate(
+    probability_correct = plogis(a_hat_2pl * (theta - b_hat_2pl)),
+    item_information = a_hat_2pl^2 * probability_correct * (1 - probability_correct),
+    item_label = paste0(item, " - ", type)
+  )
+
+difficulty_labels_2pl <- selected_items_2pl %>%
+  mutate(
+    item_label = paste0(item, " - ", type),
+    difficulty_label = paste0(
+      "b = ", round(b_hat_2pl, 2),
+      "\n",
+      "a = ", round(a_hat_2pl, 2)
+    )
+  )
+
+information_peak_labels_2pl <- information_data_2pl %>%
+  group_by(item_label) %>%
+  summarise(label_y = max(item_information), .groups = "drop") %>%
+  left_join(difficulty_labels_2pl, by = "item_label")
+
+for (lab in selected_items_2pl$item_label) {
+  
+  plot_data <- information_data_2pl %>%
+    filter(item_label == lab)
+  
+  difficulty_data <- difficulty_labels_2pl %>%
+    filter(item_label == lab)
+  
+  label_data <- information_peak_labels_2pl %>%
+    filter(item_label == lab)
+  
+  p <- ggplot(plot_data, aes(x = theta, y = item_information)) +
+    geom_line(linewidth = 1) +
+    geom_vline(
+      data = difficulty_data,
+      aes(xintercept = b_hat_2pl),
+      linetype = "dashed",
+      inherit.aes = FALSE
+    ) +
+    geom_text(
+      data = label_data,
+      aes(
+        x = b_hat_2pl,
+        y = label_y,
+        label = difficulty_label
+      ),
+      angle = 90,
+      vjust = -0.4,
+      hjust = 1.1,
+      size = 4,
+      inherit.aes = FALSE
+    ) +
+    labs(
+      title = lab,
+      subtitle = "2PL item information curve",
+      x = "Student ability",
+      y = "Item information"
+    )
+  
+  print(p)
+}
+```
+
+**Interpretation of the 2PL item information curves.**  
+In the 2PL model, item information is calculated as (a^2 \cdot p \cdot (1-p)), where (p) is the predicted probability of answering correctly and (a) is the item discrimination parameter.
+
+This graph shows how much information each selected item provides for estimating student ability at different points of the ability scale. The dashed vertical line shows the estimated difficulty of the item. The peak of the curve is located around this difficulty value, meaning that each item is most informative for students whose ability is close to the item's difficulty.
+
+Unlike the Rasch model, the 2PL model allows each item to have its own discrimination parameter. For this reason, the height of the information curve is important. Items with higher discrimination have higher information peaks and provide more precise information about student ability. Items with lower discrimination have flatter and lower information curves, meaning that they are less useful for separating students with different ability levels.
+
+Therefore, in the Rasch model the most important aspect of the information curve is mainly where the peak is located. In the 2PL model, both aspects matter: where the peak is located tells us the ability level for which the item is most useful, while the height of the peak tells us how informative the item is at its best point.
+
+This graph shows why the 2PL model can be more flexible than the Rasch model. In the Rasch model, information curves mainly differ in their horizontal position, because all items have the same discrimination. In the 2PL model, instead, information curves can also differ in height. This means that some items are not only targeted at different ability levels, but are also much more informative than others.
+
+The most informative items are those with higher discrimination, because their probability of correct answer changes more sharply around the difficulty point. Low-discrimination items have flatter information curves and provide less precise information about student ability. Therefore, this graph helps identify not only where each item is useful on the ability scale, but also how useful it is.
+
+
+As you can see also here, the hardest and the least discriminatory items are the same items (that is why the graph is the same).
+
+# 2PL difficulty and discrimination together
+
+The next graph compares the two item parameters estimated by the 2PL model. 
+
+```{r plot-2pl-difficulty-discrimination, eval=run_2pl, fig.width=10, fig.height=7}
+ggplot(results_items_2pl, aes(x = b_hat_2pl, y = a_hat_2pl, label = item)) +
+  geom_point(alpha = 0.7, size = 2) +
+  geom_label_repel(
+    size = 3,
+    max.overlaps = Inf,
+    box.padding = 0.35,
+    point.padding = 0.25,
+    min.segment.length = 0,
+    segment.size = 0.3
+  ) +
+  labs(
+    title = "Relationship between item difficulty and item discrimination",
+    subtitle = "This graph shows whether difficult items are also good at separating students",
+    x = "Posterior mean difficulty",
+    y = "Posterior mean discrimination"
+  ) +
+  coord_cartesian(clip = "off") +
+  theme(
+    plot.margin = margin(10, 30, 10, 10)
+  )
+```
+
+**Interpretation of the difficulty-discrimination graph.**  
+This graph compares the two main item parameters of the 2PL model. The x-axis shows item difficulty, while the y-axis shows item discrimination. Items on the right are more difficult, while items on the left are easier. Items higher on the graph are more discriminating, meaning that they are better at separating students with different ability levels. The best items are usually those with reasonably high discrimination, because they provide more useful information about student ability. A difficult item is not necessarily a good item: if its discrimination is low, it may be hard but not very informative.
+
+This graph is useful because it separates two concepts that are often confused: item difficulty and item quality. A difficult item is not necessarily a good measurement item. If an item is very difficult but has low discrimination, it may be hard for students but not very useful for distinguishing between different ability levels (a clear example of this are the items b10 and a10).
+
+Ideally, good items should have reasonably high discrimination. Depending on the test purpose, an item can be easy, medium, or difficult, but it should still help separate students. Items with high discrimination and medium difficulty are often especially useful because they provide information for many students around the central part of the ability distribution. Very easy or very difficult items can still be useful, but mainly for students at the extremes of the ability scale.
+
+# Validate 2PL ability with WLE
+
+```{r validate-2pl-wle, eval=run_2pl}
+cor_theta2_wle <- cor(
+  results_students_2pl$theta_hat_2pl,
+  results_students_2pl$WLE_ITA_200,
+  use = "complete.obs"
+)
+
+cor_theta2_raw <- cor(
+  results_students_2pl$theta_hat_2pl,
+  results_students_2pl$raw_score,
+  use = "complete.obs"
+)
+
+cat("Correlation between 2PL ability estimate and WLE_ITA_200:\n")
+cat("A positive value means that the Bayesian ability estimate is coherent with the official INVALSI score.\n")
+print(cor_theta2_wle)
+
+cat("\nCorrelation between 2PL ability estimate and raw proportion correct:\n")
+cat("A high positive value is expected because both variables measure student performance.\n")
+print(cor_theta2_raw)
+```
+
+```{r plot-2pl-wle, eval=run_2pl}
+ggplot(results_students_2pl, aes(x = theta_hat_2pl, y = WLE_ITA_200)) +
+  geom_point(alpha = 0.4) +
+  geom_smooth(method = "lm", se = FALSE) +
+  labs(
+    title = "2PL ability estimate vs official WLE score",
+    subtitle = "The official WLE score is used only as an external validation benchmark",
+    x = "Posterior mean theta from 2PL",
+    y = "WLE_ITA_200"
+  )
+```
+
+**Interpretation of the 2PL ability-WLE graph.**  
+This graph compares the Bayesian ability estimated by the 2PL model with the official INVALSI `WLE_ITA_200` score. The positive linear pattern shows that students with higher Bayesian ability estimates also tend to have higher official WLE scores. We can also notice that most students are concentrated in the central part of the graph, while there are fewer students with very low ability and fewer students with very high ability. This is normal in educational data: most students are around the middle, while extreme performances are less frequent.
+
+```{r plot-2pl-raw, eval=run_2pl}
+ggplot(results_students_2pl, aes(x = theta_hat_2pl, y = raw_score)) +
+  geom_point(alpha = 0.4) +
+  geom_smooth(method = "lm", se = FALSE) +
+  labs(
+    title = "2PL ability estimate vs raw proportion correct",
+    subtitle = "Students with higher estimated ability should also have higher observed scores",
+    x = "Posterior mean theta from 2PL",
+    y = "Raw proportion correct"
+  )
+```
+
+**Interpretation of the 2PL ability-raw score graph.**  
+This graph compares the posterior mean ability estimated by the 2PL model with the raw proportion of correct answers for each student. A strong positive relationship is expected because both variables measure student performance. However, the two measures are not exactly the same. The raw score is a simple proportion of correct answers, while the 2PL ability estimate also accounts for item difficulty and item discrimination.
+
+```{r plot-2pl-theta-distribution-binned, eval=run_2pl}
+# This plot shows the distribution of estimated student abilities in the 2PL model.
+# It is the 2PL version of the Rasch ability distribution plot.
+# The bars show how many students fall inside each theta interval.
+# The labels above the bars show the percentage of students in each interval.
+
+theta_breaks_2pl <- seq(-4, 4, by = 0.18)
+
+results_students_2pl_binned <- results_students_2pl %>%
+  mutate(
+    theta_bin = cut(
+      theta_hat_2pl,
+      breaks = theta_breaks_2pl,
+      include.lowest = TRUE,
+      right = FALSE
+    )
+  ) %>%
+  filter(!is.na(theta_bin)) %>%
+  count(theta_bin) %>%
+  mutate(
+    percentage = n / sum(n) * 100,
+    percentage_label = paste0(round(percentage, 1), "%")
+  )
+
+ggplot(results_students_2pl_binned, aes(x = theta_bin, y = n)) +
+  geom_col() +
+  geom_text(
+    aes(label = percentage_label),
+    vjust = -0.3,
+    size = 3
+  ) +
+  labs(
+    title = "Distribution of students by estimated 2PL ability",
+    subtitle = "Most students are expected to be concentrated around the central ability levels",
+    x = "Posterior mean theta interval",
+    y = "Number of students"
+  ) +
+  scale_y_continuous(
+    expand = expansion(mult = c(0, 0.12))
+  ) +
+  theme(
+    axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1)
+  )
+```
+
+**Interpretation of the 2PL ability distribution.**  
+This bar plot shows how the estimated 2PL abilities are distributed across students. Each bar represents a range of theta values, and the height of the bar tells us how many students fall in that range. The graph helps us see the shape of the student population. Usually, many students are concentrated around the middle of the ability scale, while very weak and very strong students are less frequent. This complements the WLE scatterplot: the scatterplot validates theta against an external score, while this bar plot shows the internal distribution of estimated ability.
+
+# Compare 1PL and 2PL estimates
+
+```{r compare-1pl-2pl, eval=run_2pl}
+student_score_compare <- rowMeans(Y)
+item_score_compare <- colMeans(Y)
+
+theta_hat_1pl <- as.numeric(theta_hat_1pl)
+theta_hat_2pl <- as.numeric(theta_hat_2pl)
+b_hat_1pl <- as.numeric(b_hat_1pl)
+b_hat_2pl <- as.numeric(b_hat_2pl)
+a_hat_2pl <- as.numeric(a_hat_2pl)
+
+stopifnot(length(sample_id) == nrow(Y))
+stopifnot(length(theta_hat_1pl) == nrow(Y))
+stopifnot(length(theta_hat_2pl) == nrow(Y))
+stopifnot(length(student_score_compare) == nrow(Y))
+stopifnot(length(wle) == nrow(Y))
+
+stopifnot(length(b_hat_1pl) == ncol(Y))
+stopifnot(length(b_hat_2pl) == ncol(Y))
+stopifnot(length(a_hat_2pl) == ncol(Y))
+stopifnot(length(item_score_compare) == ncol(Y))
+
+results_compare_students <- data.frame(
+  student_id = sample_id,
+  theta_hat_1pl = theta_hat_1pl,
+  theta_hat_2pl = theta_hat_2pl,
+  raw_score = student_score_compare,
+  WLE_ITA_200 = wle
+)
+
+cor_theta_1pl_2pl <- cor(
+  results_compare_students$theta_hat_1pl,
+  results_compare_students$theta_hat_2pl,
+  use = "complete.obs"
+)
+
+cat("Correlation between student ability estimates from 1PL and 2PL:\n")
+cat("A high positive value means that the two models rank students similarly.\n")
+print(cor_theta_1pl_2pl)
+
+results_compare_items <- data.frame(
+  item = colnames(Y),
+  b_hat_1pl = b_hat_1pl,
+  b_hat_2pl = b_hat_2pl,
+  a_hat_2pl = a_hat_2pl,
+  proportion_correct = item_score_compare
+)
+
+cor_b_1pl_2pl <- cor(
+  results_compare_items$b_hat_1pl,
+  results_compare_items$b_hat_2pl,
+  use = "complete.obs"
+)
+
+cat("\nCorrelation between item difficulty estimates from 1PL and 2PL:\n")
+cat("A high positive value means that the two models rank item difficulty similarly.\n")
+print(cor_b_1pl_2pl)
+```
+
+```{r plot-theta-compare, eval=run_2pl}
+ggplot(results_compare_students, aes(x = theta_hat_1pl, y = theta_hat_2pl)) +
+  geom_point(alpha = 0.4) +
+  geom_smooth(method = "lm", se = FALSE) +
+  labs(
+    title = "Student ability estimates: 1PL vs 2PL",
+    x = "Posterior mean theta from 1PL",
+    y = "Posterior mean theta from 2PL"
+  )
+```
+
+**Interpretation of the 1PL-2PL ability comparison graph.**  
+This graph compares the student ability estimates produced by the Rasch model and by the 2PL model. Each point is one student. If the points follow a clear increasing pattern, the two models rank students in a similar way. Differences are still possible because the 2PL model also considers item discrimination, while the Rasch model assumes the same discrimination for all items.
+As you can see in the graph, they are basiclaly the same.
+
+```{r plot-b-compare, eval=run_2pl, fig.width=10, fig.height=7}
+ggplot(results_compare_items, aes(x = b_hat_1pl, y = b_hat_2pl, label = item)) +
+  geom_point(alpha = 0.7, size = 2) +
+  geom_smooth(method = "lm", se = FALSE) +
+  geom_label_repel(
+    size = 3,
+    max.overlaps = Inf,
+    box.padding = 0.35,
+    point.padding = 0.25,
+    min.segment.length = 0,
+    segment.size = 0.3
+  ) +
+  labs(
+    title = "Item difficulty estimates: 1PL vs 2PL",
+    subtitle = "Each label identifies the corresponding item",
+    x = "Posterior mean difficulty from 1PL",
+    y = "Posterior mean difficulty from 2PL"
+  ) +
+  coord_cartesian(clip = "off") +
+  theme(
+    plot.margin = margin(10, 30, 10, 10)
+  )
+```
+
+**Interpretation of the 1PL-2PL difficulty comparison graph.**  
+This graph compares the difficulty estimated for each item by the Rasch model and by the 2PL model. Each point is one item. A strong positive pattern means that the two models generally agree about which items are easier and which items are harder. However, the 2PL estimates can change because the model also estimates discrimination, so item difficulty is adjusted together with how informative the item is (that is why for example there are points such as a10 and b10).
+
+# 2PL posterior predictive check
+In this posterior predictive check, we simulated a new artificial response matrix from the fitted 2PL model. First, the model estimated the probability that each student answers each item correctly, using the posterior estimates of ability, difficulty, and discrimination. Then, using these predicted probabilities, we generated a replicated sample of binary responses, where each value is either 0 or 1. This replicated dataset represents what we would expect to observe if the fitted 2PL model were the true data-generating process. Finally, we compared the observed proportions with both the predicted probabilities and the replicated proportions. The fact that these values are generally close suggests that the 2PL model is able to reproduce the main item-level patterns of the observed data.
+
+```{r ppc-2pl, eval=run_2pl}
+p_hat_2pl <- matrix(NA, nrow = N, ncol = J)
+
+for(j in 1:J) {
+  p_hat_2pl[, j] <- inv_logit(a_hat_2pl[j] * (theta_hat_2pl - b_hat_2pl[j]))
+}
+
+Y_rep_2pl <- matrix(
+  rbinom(N * J, size = 1, prob = as.vector(p_hat_2pl)),
+  nrow = N,
+  ncol = J
+)
+
+replicated_student_score_2pl <- rowMeans(Y_rep_2pl)
+expected_student_score_2pl <- rowMeans(p_hat_2pl)
+
+ppc_students_2pl <- data.frame(
+  observed = observed_student_score,
+  expected_prediction = expected_student_score_2pl,
+  replicated = replicated_student_score_2pl
+)
+
+ppc_items_2pl <- data.frame(
+  item = colnames(Y),
+  observed_proportion = colMeans(Y),
+  predicted_probability = colMeans(p_hat_2pl),
+  replicated_proportion = colMeans(Y_rep_2pl)
+)
+
+cat("Summary statistics of observed student scores:\n")
+cat("These values come from the real INVALSI response matrix.\n")
+print(summary(observed_student_score))
+
+cat("\nSummary statistics of replicated student scores from the 2PL model:\n")
+cat("These values come from fake data simulated using the fitted 2PL model.\n")
+print(summary(replicated_student_score_2pl))
+
+cat("\nItem-level posterior predictive check for the 2PL model:\n")
+cat("Observed proportions are compared with predicted probabilities and replicated proportions.\n")
+print(ppc_items_2pl)
+```
+
+
+```{r ppc-2pl-students, eval=run_2pl}
+ggplot(ppc_students_2pl, aes(x = observed, y = expected_prediction)) +
+  geom_point(alpha = 0.4) +
+  geom_abline(intercept = 0, slope = 1, linetype = "dashed") +
+  labs(
+    title = "Posterior predictive check: student scores, 2PL model",
+    x = "Observed proportion correct",
+    y = "Expected predicted proportion correct"
+  )
+```
+
+**Interpretation of the 2PL student posterior predictive scatter plot.**  
+Each point represents one student. The x-axis shows the observed proportion of correct answers obtained by the student, while the y-axis shows the expected proportion of correct answers predicted by the fitted 2PL model.
+
+The dashed diagonal line represents perfect agreement between observed and predicted performance. Points close to this line indicate that the model predicts student performance well. A clear positive pattern is expected because students with higher observed scores should also receive higher predicted scores from the model.
+
+This graph is useful because it checks the model at the student level, not only at the item level or in the general histogram. Compared with the Rasch model, the 2PL model can also use item discrimination, so items that separate students more strongly can have more influence on the estimated ability and on the predicted student score.
+
+If the points are close to the diagonal line, the 2PL model reproduces the observed student scores well. If some points are systematically above the line, the model is overpredicting those students' performance. If some points are systematically below the line, the model is underpredicting their performance.
+
+```{r ppc-2pl-hist, eval=run_2pl}
+df_ppc_students_2pl <- data.frame(
+  score = c(observed_student_score, replicated_student_score_2pl),
+  data_type = rep(c("Observed data", "Replicated data from 2PL"), each = N)
+)
+
+ggplot(df_ppc_students_2pl, aes(x = score, fill = data_type)) +
+  geom_histogram(alpha = 0.5, position = "identity", bins = 98) +
+  labs(
+    title = "Observed vs replicated student scores, 2PL model",
+    x = "Proportion correct",
+    y = "Number of students"
+  )
+```
+
+**Interpretation of the 2PL posterior predictive histogram.**  
+This histogram compares the real distribution of student scores with a replicated distribution simulated from the fitted 2PL model. If the two histograms overlap well, the model is able to reproduce the general level and spread of student performance. If the replicated distribution is very different from the observed one, this would suggest that the model is missing some important part of the response structure.
+
+If the observed and replicated histograms overlap well, this suggests that the 2PL model is able to reproduce the overall distribution of student performance. This means that, after estimating ability, difficulty, and discrimination, the model can generate artificial data with a similar structure to the real data.
+
+Small differences between the two histograms are normal because the replicated data are simulated and therefore contain random variation. However, large differences would suggest that the model is missing some important feature of the observed responses. As in the Rasch model, this graph should be interpreted as a global fit check: it tells us whether the model reproduces the general distribution of scores, but it does not prove that every single item is perfectly fitted.
+
+In any case, this histograms looks look enough for our porpuses.
+
+```{r ppc-2pl-items, eval=run_2pl, fig.width=10, fig.height=7}
+ggplot(ppc_items_2pl, aes(x = observed_proportion, y = predicted_probability, label = item)) +
+  geom_point(size = 2) +
+  geom_abline(intercept = 0, slope = 1, linetype = "dashed") +
+  geom_label_repel(
+    size = 3,
+    max.overlaps = Inf,
+    box.padding = 0.35,
+    point.padding = 0.25,
+    min.segment.length = 0,
+    segment.size = 0.3
+  ) +
+  labs(
+    title = "Observed vs predicted item performance, 2PL model",
+    x = "Observed proportion correct",
+    y = "Predicted probability correct"
+  ) +
+  coord_cartesian(clip = "off") +
+  theme(
+    plot.margin = margin(10, 30, 10, 10)
+  )
+```
+
+**Interpretation of the 2PL item posterior predictive scatter plot.**  
+Each point represents one item. The x-axis shows the observed proportion of students who answered that item correctly, while the y-axis shows the average predicted probability of a correct answer according to the fitted 2PL model. The dashed diagonal line represents perfect agreement between observed and predicted item performance. Points close to the line mean that the 2PL model reproduces the observed item performance well.
+
+Overall, if the points are close to the diagonal line, the 2PL model reproduces item-level performance well. This means that the average predicted probability for each item is close to the observed proportion of correct answers. Items far from the diagonal line would be more problematic, because they would indicate that the model overpredicts or underpredicts the performance on those specific items.
+
+This check is important because a model can fit student scores reasonably well but still have problems with some individual items. For this reason, the item-level posterior predictive check complements the student-level predictive check and gives a more detailed view of model fit.
+
+```{r ppc-2pl-predicted-vs-replicated, eval=run_2pl, fig.width=10, fig.height=7}
+ppc_items_2pl <- ppc_items_2pl %>%
+  mutate(
+    replication_error = replicated_proportion - predicted_probability,
+    abs_replication_error = abs(replication_error)
+  )
+
+ggplot(
+  ppc_items_2pl,
+  aes(
+    x = predicted_probability,
+    y = replicated_proportion,
+    label = item
+  )
+) +
+  geom_point(size = 2) +
+  geom_abline(intercept = 0, slope = 1, linetype = "dashed") +
+  geom_label_repel(
+    size = 3,
+    max.overlaps = Inf,
+    box.padding = 0.35,
+    point.padding = 0.25,
+    min.segment.length = 0,
+    segment.size = 0.3
+  ) +
+  labs(
+    title = "Predicted vs replicated item performance, 2PL model",
+    x = "Predicted probability correct",
+    y = "Replicated proportion correct"
+  ) +
+  coord_cartesian(clip = "off") +
+  theme(
+    plot.margin = margin(10, 30, 10, 10)
+  )
+```
+
+**Predicted probability vs replicated proportion.**  
+This graph compares the model's expected probability of a correct answer with the proportion of correct answers obtained in one replicated dataset generated from the fitted 2PL model. Points close to the dashed diagonal line indicate that the simulated item proportions are coherent with the probabilities predicted by the model. Small deviations from the diagonal line are normal, because `replicated_proportion` is based on simulated 0/1 responses and therefore includes random simulation noise. For this reason, the graph should not be interpreted as requiring perfect equality between predicted and replicated values. Instead, it checks whether the replicated data behave in a way that is broadly consistent with the model predictions.
+
+# Predictive comparison: 1PL vs 2PL
+
+```{r predictive-comparison, eval=run_2pl}
+p2_safe <- clip_probs(p_hat_2pl)
+
+log_loss_2pl <- -mean(
+  Y * log(p2_safe) + (1 - Y) * log(1 - p2_safe)
+)
+
+accuracy_2pl <- mean((p_hat_2pl > 0.5) == Y)
+
+student_rmse_2pl <- rmse(observed_student_score, expected_student_score_2pl)
+student_mae_2pl <- mae(observed_student_score, expected_student_score_2pl)
+
+student_correlation_2pl <- cor(
+  observed_student_score,
+  expected_student_score_2pl,
+  use = "complete.obs"
+)
+
+expected_item_score_2pl <- colMeans(p_hat_2pl)
+
+item_rmse_2pl <- rmse(observed_item_score, expected_item_score_2pl)
+item_mae_2pl <- mae(observed_item_score, expected_item_score_2pl)
+
+item_correlation_2pl <- cor(
+  observed_item_score,
+  expected_item_score_2pl,
+  use = "complete.obs"
+)
+
+indices_2pl <- data.frame(
+  model = "2PL",
+  log_loss = log_loss_2pl,
+  accuracy = accuracy_2pl,
+  student_rmse = student_rmse_2pl,
+  student_mae = student_mae_2pl,
+  student_correlation = student_correlation_2pl,
+  item_rmse = item_rmse_2pl,
+  item_mae = item_mae_2pl,
+  item_correlation = item_correlation_2pl
+)
+
+predictive_comparison <- rbind(
+  indices_1pl,
+  indices_2pl
+)
+
+cat("Predictive comparison between the Rasch / 1PL model and the 2PL model:\n")
+cat("Lower log_loss, RMSE, and MAE are better. Higher accuracy, student_correlation, and item_correlation are better.\n")
+print(predictive_comparison)
+```
+
+# AIC and BIC comparison
+
+**AIC and BIC.**  
+The **Akaike Information Criterion (AIC)** and the **Bayesian Information Criterion (BIC)** are classical model comparison criteria based on the log-likelihood. Both criteria reward models that fit the data well, but they also penalize models with more parameters, so that a model is not preferred only because it is more flexible. Their formulas are:
+
+\[
+AIC = -2\log L(\hat{\theta}) + 2k
+\]
+
+\[
+BIC = -2\log L(\hat{\theta}) + k\log(n)
+\]
+
+where \(\log L(\hat{\theta})\) is the log-likelihood evaluated at the estimated parameters, \(k\) is the number of estimated parameters, and \(n\) is the number of observed responses. Lower AIC or BIC values indicate a better trade-off between model fit and model complexity. In this project, these values are computed as approximate frequentist-style indicators, because the models are Bayesian and the log-likelihood is evaluated at the posterior mean parameters rather than at maximum likelihood estimates.
+
+```{r aic-bic-comparison, eval=run_2pl}
+extract_posterior_mean <- function(samples, par_name) {
+  samples_matrix <- as.matrix(samples)
+  selected_columns <- grep(
+    paste0("^", par_name, "\\["),
+    colnames(samples_matrix),
+    value = TRUE
+  )
+  
+  selected_columns <- selected_columns[
+    order(as.numeric(gsub(paste0(par_name, "\\[|\\]"), "", selected_columns)))
+  ]
+  
+  colMeans(samples_matrix[, selected_columns, drop = FALSE])
+}
+
+log_likelihood_1pl <- function(Y, theta, b) {
+  p <- plogis(outer(theta, b, "-"))
+  p <- pmin(pmax(p, 1e-10), 1 - 1e-10)
+  
+  sum(
+    Y * log(p) + (1 - Y) * log(1 - p),
+    na.rm = TRUE
+  )
+}
+
+log_likelihood_2pl <- function(Y, theta, b, a) {
+  eta <- sweep(outer(theta, b, "-"), 2, a, "*")
+  p <- plogis(eta)
+  p <- pmin(pmax(p, 1e-10), 1 - 1e-10)
+  
+  sum(
+    Y * log(p) + (1 - Y) * log(1 - p),
+    na.rm = TRUE
+  )
+}
+
+Y_ic <- Y
+n_observed <- sum(!is.na(Y_ic))
+
+theta_hat_1pl_ic <- extract_posterior_mean(samples_rasch, "theta")
+b_hat_1pl_ic <- extract_posterior_mean(samples_rasch, "b")
+
+theta_hat_2pl_ic <- extract_posterior_mean(samples_2pl, "theta")
+b_hat_2pl_ic <- extract_posterior_mean(samples_2pl, "b")
+a_hat_2pl_ic <- extract_posterior_mean(samples_2pl, "a")
+
+ll_1pl <- log_likelihood_1pl(Y_ic, theta_hat_1pl_ic, b_hat_1pl_ic)
+ll_2pl <- log_likelihood_2pl(Y_ic, theta_hat_2pl_ic, b_hat_2pl_ic, a_hat_2pl_ic)
+
+k_1pl <- length(theta_hat_1pl_ic) + length(b_hat_1pl_ic)
+k_2pl <- length(theta_hat_2pl_ic) + length(b_hat_2pl_ic) + length(a_hat_2pl_ic)
+
+aic_bic_results <- data.frame(
+  model = c("1PL / Rasch", "2PL"),
+  log_likelihood = c(ll_1pl, ll_2pl),
+  number_parameters = c(k_1pl, k_2pl),
+  n_observed = c(n_observed, n_observed),
+  AIC = c(
+    -2 * ll_1pl + 2 * k_1pl,
+    -2 * ll_2pl + 2 * k_2pl
+  ),
+  BIC = c(
+    -2 * ll_1pl + log(n_observed) * k_1pl,
+    -2 * ll_2pl + log(n_observed) * k_2pl
+  )
+)
+
+aic_bic_results %>%
+  knitr::kable(
+    digits = 3,
+    caption = "Approximate AIC and BIC comparison between the 1PL/Rasch and 2PL models"
+  )
+```
+
+**Interpretation of AIC and BIC.**  
+AIC and BIC provide an additional comparison between the Rasch / 1PL model and the 2PL model. If the 2PL model has lower AIC or BIC, this means that its better fit is large enough to compensate for the additional discrimination parameters. If the values are similar, or if the Rasch model has lower values, then the simpler model may be preferable. However, in this Bayesian project these indicators should be interpreted only as approximate support, because DIC is more directly connected to the MCMC posterior distribution.
+
+In our case for both indicators 2pl is better.
+
+# DIC comparison
+
+**Deviance Information Criterion.**  
+The **Deviance Information Criterion (DIC)** is a Bayesian model comparison criterion designed for models estimated with MCMC methods. It is based on the **deviance**, which measures lack of fit: lower deviance means better fit to the observed data. At the same time, DIC penalizes model complexity through an effective number of parameters. The formula is:
+
+\[
+DIC = \bar{D}(\theta) + p_D = 2\bar{D}(\theta) - D(\bar{\theta})
+\]
+
+where:
+
+\[
+D(\theta) = -2\log p(y \mid \theta) + C
+\]
+
+\(\bar{D}(\theta)\) is the posterior mean deviance,
+\(D(\bar{\theta})\) is the deviance evaluated at the posterior mean parameters, and
+\(p_D = \bar{D}(\theta) - D(\bar{\theta})\) is the effective number of parameters. Therefore, DIC rewards good fit but penalizes excessive complexity. A lower DIC usually indicates a better balance between model fit and model complexity.
+
+In this project, DIC is especially useful because the 1PL/Rasch and 2PL models are Bayesian models estimated through MCMC. Compared with AIC and BIC, DIC is more appropriate here because it uses the posterior distribution and an effective complexity penalty, instead of relying only on maximum likelihood estimates and a fixed number of parameters. For this reason, DIC is the main information criterion used to compare the simpler Rasch model with the more flexible 2PL model.
+
+DIC computation can be slower than AIC and BIC because it is based on posterior deviance information. In reuse mode, the saved DIC results are loaded and not recomputed.
+
+```{r dic-comparison, eval=run_dic}
+if(reuse_existing_results) {
+  load(file.path(results_dir, "dic_results.RData"), envir = .GlobalEnv)
+  cat("Reuse mode: DIC results loaded from dic_results.RData. They are not recomputed.\n\n")
+}
+
+cat("DIC for the Rasch / 1PL model:\n")
+cat("Lower DIC usually indicates a better trade-off between fit and complexity.\n")
+print(dic_rasch)
+
+dic_comparison <- extract_dic_values(dic_rasch, "Rasch / 1PL")
+
+if(run_2pl && exists("dic_2pl")) {
+  cat("\nDIC for the 2PL model:\n")
+  cat("This can be compared with the Rasch DIC. Lower DIC is usually preferred.\n")
+  print(dic_2pl)
+
+  dic_comparison <- rbind(
+    dic_comparison,
+    extract_dic_values(dic_2pl, "2PL")
+  )
+}
+
+cat("\nSimple DIC comparison table:\n")
+print(dic_comparison)
+```
+
+**Interpretation of the DIC table.**  
+The DIC table compares the two Bayesian IRT models by combining model fit and effective complexity. The 2PL model is more flexible because it estimates both item difficulty and item discrimination, while the Rasch model estimates only item difficulty. Therefore, the 2PL model should be preferred only if its improvement in fit is large enough to compensate for this additional complexity. If the DIC difference is small, the evidence in favour of one model is weak and the simpler Rasch model can still be considered competitive.
+
+## Deviance trace for DIC stability
+
+The DIC is computed from the posterior deviance. For this reason, I also inspect the MCMC trace of the total deviance. This is not exactly a trace of the DIC itself, because DIC is a final summary value, but it is a useful check of the quantity on which the DIC is based. If the deviance trace fluctuates around a stable level and the chains overlap well, the DIC estimate is more reliable. If the deviance trace has strong trends or separated chains, the DIC comparison should be interpreted with caution.
+
+```{r deviance-trace-rasch, eval=run_dic, fig.width=9, fig.height=5}
+if(exists("deviance_trace_rasch")) {
+  cat("Trace of total deviance for the Rasch / 1PL model:\n")
+  traceplot(deviance_trace_rasch)
+  
+  cat("\nSummary of total deviance for the Rasch / 1PL model:\n")
+  print(summary(deviance_trace_rasch))
+  
+  deviance_trace_summary_rasch <- summarise_deviance_trace(
+    deviance_trace_rasch,
+    "Rasch / 1PL"
+  )
+  
+  cat("\nCompact summary of total deviance for the Rasch / 1PL model:\n")
+  print(deviance_trace_summary_rasch)
+} else {
+  cat(
+    "The Rasch deviance trace is not available. ",
+    "Run the project once in fast or final mode with run_dic = TRUE, ",
+    "then reuse mode will be able to load it.\n"
+  )
+}
+```
+
+The traceplot above checks whether the total deviance of the Rasch / 1PL model is stable across the MCMC iterations. A stable trace should move around a constant level without long trends. This matters because the DIC uses the posterior deviance, so an unstable deviance chain would make the final DIC value less trustworthy.
+
+```{r deviance-trace-2pl, eval=run_dic && run_2pl, fig.width=9, fig.height=5}
+if(exists("deviance_trace_2pl")) {
+  cat("Trace of total deviance for the 2PL model:\n")
+  traceplot(deviance_trace_2pl)
+  
+  cat("\nSummary of total deviance for the 2PL model:\n")
+  print(summary(deviance_trace_2pl))
+  
+  deviance_trace_summary_2pl <- summarise_deviance_trace(
+    deviance_trace_2pl,
+    "2PL"
+  )
+  
+  cat("\nCompact summary of total deviance for the 2PL model:\n")
+  print(deviance_trace_summary_2pl)
+} else {
+  cat(
+    "The 2PL deviance trace is not available. ",
+    "Run the project once in fast or final mode with run_dic = TRUE, ",
+    "then reuse mode will be able to load it.\n"
+  )
+}
+```
+
+The traceplot above performs the same check for the 2PL model. Since the 2PL model is more flexible and has more parameters, checking the deviance trace is especially useful before interpreting its DIC. If the deviance trace is stable, the DIC comparison between Rasch / 1PL and 2PL is more credible.
+
+```{r deviance-trace-comparison, eval=run_dic}
+dev_trace_tables <- list()
+
+if(exists("deviance_trace_summary_rasch")) {
+  dev_trace_tables[[length(dev_trace_tables) + 1]] <- deviance_trace_summary_rasch
+}
+
+if(exists("deviance_trace_summary_2pl")) {
+  dev_trace_tables[[length(dev_trace_tables) + 1]] <- deviance_trace_summary_2pl
+}
+
+if(length(dev_trace_tables) > 0) {
+  deviance_trace_comparison <- do.call(rbind, dev_trace_tables)
+  
+  cat("Comparison of total deviance traces:\n")
+  print(deviance_trace_comparison)
+} else {
+  cat("No deviance trace summaries are available yet.\n")
+}
+```
+
+# Save results
+
+```{r save-results}
+if(reuse_existing_results) {
+
+  cat("Reuse mode is active. Existing result files were loaded and not overwritten.\n")
+  cat("The simulation settings were retrieved from run_metadata.RData.\n")
+
+} else {
+
+  run_metadata <- list(
+    run_mode = run_mode,
+    n_sample = N,
+    n_items = J,
+    n_chains = n_chains,
+    n_adapt = n_adapt,
+    burn_in = burn_in,
+    n_iter = n_iter,
+    thin_value = thin_value,
+    run_2pl = run_2pl,
+    run_dic = run_dic,
+    data_path = data_path,
+    results_dir = normalizePath(results_dir, mustWork = FALSE),
+    saved_at = Sys.time()
+  )
+
+  write.csv(results_students_1pl, file.path(results_dir, "results_students_1pl.csv"), row.names = FALSE)
+  write.csv(results_items_1pl, file.path(results_dir, "results_items_1pl.csv"), row.names = FALSE)
+
+  if(run_2pl) {
+    write.csv(results_students_2pl, file.path(results_dir, "results_students_2pl.csv"), row.names = FALSE)
+    write.csv(results_items_2pl, file.path(results_dir, "results_items_2pl.csv"), row.names = FALSE)
+    write.csv(predictive_comparison, file.path(results_dir, "predictive_comparison.csv"), row.names = FALSE)
+    
+    if(exists("aic_bic_results")) {
+      write.csv(aic_bic_results, file.path(results_dir, "aic_bic_results.csv"), row.names = FALSE)
+    }
+  }
+
+  rasch_objects_to_save <- c(
+    "samples_rasch",
+    "results_students_1pl",
+    "results_items_1pl",
+    "indices_1pl"
+  )
+
+  if(run_dic && exists("dic_rasch")) {
+    rasch_objects_to_save <- c(rasch_objects_to_save, "dic_rasch")
+  }
+
+  if(run_dic && exists("deviance_trace_rasch")) {
+    rasch_objects_to_save <- c(rasch_objects_to_save, "deviance_trace_rasch")
+  }
+
+  save(
+    list = rasch_objects_to_save,
+    file = file.path(results_dir, "rasch_results.RData")
+  )
+
+  if(run_2pl) {
+
+    two_pl_objects_to_save <- c(
+      "samples_2pl",
+      "results_students_2pl",
+      "results_items_2pl",
+      "predictive_comparison"
+    )
+    
+    if(exists("aic_bic_results")) {
+      two_pl_objects_to_save <- c(two_pl_objects_to_save, "aic_bic_results")
+    }
+
+    if(run_dic && exists("dic_2pl")) {
+      two_pl_objects_to_save <- c(two_pl_objects_to_save, "dic_2pl")
+    }
+
+    if(run_dic && exists("deviance_trace_2pl")) {
+      two_pl_objects_to_save <- c(two_pl_objects_to_save, "deviance_trace_2pl")
+    }
+
+    save(
+      list = two_pl_objects_to_save,
+      file = file.path(results_dir, "two_model_comparison_results.RData")
+    )
+  }
+
+  if(run_dic && exists("dic_comparison")) {
+
+    dic_objects_to_save <- c("dic_rasch", "dic_comparison")
+
+    if(exists("dic_2pl")) {
+      dic_objects_to_save <- c(dic_objects_to_save, "dic_2pl")
+    }
+
+    if(exists("deviance_trace_rasch")) {
+      dic_objects_to_save <- c(dic_objects_to_save, "deviance_trace_rasch")
+    }
+
+    if(exists("deviance_trace_2pl")) {
+      dic_objects_to_save <- c(dic_objects_to_save, "deviance_trace_2pl")
+    }
+
+    if(exists("deviance_trace_comparison")) {
+      dic_objects_to_save <- c(dic_objects_to_save, "deviance_trace_comparison")
+    }
+
+    save(
+      list = dic_objects_to_save,
+      file = file.path(results_dir, "dic_results.RData")
+    )
+
+    write.csv(dic_comparison, file.path(results_dir, "dic_comparison.csv"), row.names = FALSE)
+
+    if(exists("deviance_trace_comparison")) {
+      write.csv(
+        deviance_trace_comparison,
+        file.path(results_dir, "deviance_trace_comparison.csv"),
+        row.names = FALSE
+      )
+    }
+  }
+
+  save(
+    run_metadata,
+    file = file.path(results_dir, "run_metadata.RData")
+  )
+
+  cat("Files saved in the current working directory:\n")
+  cat("- sampled_data.RData\n")
+  cat("- run_metadata.RData\n")
+  cat("- results_students_1pl.csv\n")
+  cat("- results_items_1pl.csv\n")
+  cat("- rasch_results.RData\n")
+
+  if(run_2pl) {
+    cat("- results_students_2pl.csv\n")
+    cat("- results_items_2pl.csv\n")
+    cat("- predictive_comparison.csv\n")
+    cat("- two_model_comparison_results.RData\n")
+  }
+
+  if(run_dic && exists("dic_comparison")) {
+    cat("- dic_results.RData\n")
+    cat("- dic_comparison.csv\n")
+  }
+}
+```
+
+# Final results to discuss
+
+Some important results to discuss:
+
+```{r final-objects}
+cat("Main Rasch / 1PL validation results:\n")
+cat("Correlation between Rasch ability and WLE_ITA_200:\n")
+print(cor_theta1_wle)
+
+cat("\nCorrelation between Rasch ability and raw score:\n")
+print(cor_theta1_raw)
+
+cat("\nCorrelation between Rasch item difficulty and observed item proportion correct:\n")
+print(cor_b1_itemscore)
+
+cat("\nPredictive indices for the Rasch / 1PL model:\n")
+print(indices_1pl)
+
+if(run_2pl) {
+  cat("\nMain 2PL validation and comparison results:\n")
+
+  cat("\nCorrelation between 2PL ability and WLE_ITA_200:\n")
+  print(cor_theta2_wle)
+
+  cat("\nCorrelation between 2PL ability and raw score:\n")
+  print(cor_theta2_raw)
+
+  cat("\nCorrelation between 1PL and 2PL ability estimates:\n")
+  print(cor_theta_1pl_2pl)
+
+  cat("\nCorrelation between 1PL and 2PL item difficulty estimates:\n")
+  print(cor_b_1pl_2pl)
+
+  cat("\nPredictive comparison between 1PL and 2PL:\n")
+  print(predictive_comparison)
+}
+```
+
+# Conclusion
+
+The Rasch model estimates student ability and item difficulty using a simple and interpretable Bayesian IRT structure.
+
+The 2PL model extends the Rasch model by adding item discrimination. This allows some items to be more informative than others.
+
+The comparison with `WLE_ITA_200` is useful because it checks whether the Bayesian ability estimates move in the same direction as the official INVALSI score.
+
+The posterior predictive checks and predictive indices help evaluate whether the models reproduce the observed response matrix well.
+
+If the 2PL model has lower log-loss, better predictive indices, and meaningful discrimination parameters, then it provides more information than the simpler Rasch model. If the results are very similar, then the Rasch model may be preferred because it is simpler and easier to interpret.
+
+Using dic as well, we can however notice that 2pl is a lot better.
